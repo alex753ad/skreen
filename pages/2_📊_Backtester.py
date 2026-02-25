@@ -684,16 +684,21 @@ if mode == "🔍 Одна пара":
             limit = lookback_days * hpb_map.get(timeframe, 6)
             
             try:
-                # v27: Retry on network errors
+                # v27: Retry on network errors + futures first
                 import ccxt as _ccxt
                 ohlcv1, ohlcv2 = None, None
-                for _att in range(3):
-                    try:
-                        ohlcv1 = ex.fetch_ohlcv(f"{coin1}/USDT", timeframe, limit=limit)
-                        ohlcv2 = ex.fetch_ohlcv(f"{coin2}/USDT", timeframe, limit=limit)
+                for _sym_suffix in [':USDT', '']:  # try futures first
+                    for _att in range(3):
+                        try:
+                            ohlcv1 = ex.fetch_ohlcv(f"{coin1}/USDT{_sym_suffix}", timeframe, limit=limit)
+                            ohlcv2 = ex.fetch_ohlcv(f"{coin2}/USDT{_sym_suffix}", timeframe, limit=limit)
+                            break
+                        except (_ccxt.NetworkError, _ccxt.RequestTimeout, _ccxt.ExchangeNotAvailable):
+                            import time as _t; _t.sleep([2, 5, 15][_att])
+                        except:
+                            break
+                    if ohlcv1 and ohlcv2:
                         break
-                    except (_ccxt.NetworkError, _ccxt.RequestTimeout, _ccxt.ExchangeNotAvailable):
-                        import time as _t; _t.sleep([2, 5, 15][_att])
                 if ohlcv1 is None or ohlcv2 is None:
                     st.error("❌ Не удалось загрузить данные после 3 попыток"); st.stop()
                 df1 = pd.DataFrame(ohlcv1, columns=['ts','o','h','l','c','v'])
@@ -844,15 +849,17 @@ elif mode == "🔄 Автоскан":
         import ccxt as _ccxt
         for i, coin in enumerate(coins):
             prog.progress((i+1)/len(coins), f"📥 {coin}")
-            for _att in range(2):
-                try:
-                    ohlcv = ex.fetch_ohlcv(f"{coin}/USDT", timeframe, limit=limit)
-                    df = pd.DataFrame(ohlcv, columns=['ts','o','h','l','c','v'])
-                    if len(df) >= 100: prices[coin] = df['c'].values
-                    break
-                except (_ccxt.NetworkError, _ccxt.RequestTimeout):
-                    import time as _t; _t.sleep(3)
-                except: break
+            for _sym_suffix in [':USDT', '']:  # futures first
+                for _att in range(2):
+                    try:
+                        ohlcv = ex.fetch_ohlcv(f"{coin}/USDT{_sym_suffix}", timeframe, limit=limit)
+                        df = pd.DataFrame(ohlcv, columns=['ts','o','h','l','c','v'])
+                        if len(df) >= 100: prices[coin] = df['c'].values
+                        break
+                    except (_ccxt.NetworkError, _ccxt.RequestTimeout):
+                        import time as _t; _t.sleep(3)
+                    except: break
+                if coin in prices: break
         prog.empty()
         
         # Cointegration scan with FDR correction (v7.0)
