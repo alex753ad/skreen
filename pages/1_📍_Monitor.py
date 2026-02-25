@@ -318,6 +318,27 @@ def close_position(pos_id, exit_price1, exit_price2, exit_z, reason):
             save_trade_to_history(closed_pos)
         except Exception:
             pass
+        # v27: Update pair memory
+        try:
+            from config_loader import pair_memory_update
+            _pair = f"{closed_pos['coin1']}/{closed_pos['coin2']}"
+            _entry_dt = closed_pos.get('entry_time', '')
+            _exit_dt = closed_pos.get('exit_time', '')
+            try:
+                from datetime import datetime
+                _et = datetime.fromisoformat(str(_entry_dt))
+                _xt = datetime.fromisoformat(str(_exit_dt))
+                _hold_h = (_xt - _et).total_seconds() / 3600
+            except Exception:
+                _hold_h = 0
+            pair_memory_update(
+                _pair, closed_pos.get('pnl_pct', 0), _hold_h,
+                closed_pos.get('direction', ''), 
+                closed_pos.get('entry_z', 0),
+                closed_pos.get('exit_z', 0)
+            )
+        except Exception:
+            pass
 
 
 def save_trade_to_history(trade):
@@ -413,37 +434,41 @@ def _get_exchange(exchange_name):
 
 @st.cache_data(ttl=120)
 def fetch_prices(exchange_name, coin, timeframe, lookback_bars=300):
-    """v27: Fetch with retry on network errors."""
+    """v27: Fetch with retry + futures first."""
     import ccxt as _ccxt
-    for _attempt in range(3):
-        try:
-            ex, actual = _get_exchange(exchange_name)
-            if ex is None: return None
-            symbol = f"{coin}/USDT"
-            ohlcv = ex.fetch_ohlcv(symbol, timeframe, limit=lookback_bars)
-            df = pd.DataFrame(ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-            df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-            return df
-        except (_ccxt.NetworkError, _ccxt.RequestTimeout, _ccxt.ExchangeNotAvailable):
-            time.sleep([2, 5, 15][_attempt])
-        except:
-            return None
+    # Try futures first, then spot
+    symbols = [f"{coin}/USDT:USDT", f"{coin}/USDT"]
+    for symbol in symbols:
+        for _attempt in range(3):
+            try:
+                ex, actual = _get_exchange(exchange_name)
+                if ex is None: return None
+                ohlcv = ex.fetch_ohlcv(symbol, timeframe, limit=lookback_bars)
+                df = pd.DataFrame(ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
+                df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+                return df
+            except (_ccxt.NetworkError, _ccxt.RequestTimeout, _ccxt.ExchangeNotAvailable):
+                time.sleep([2, 5, 15][_attempt])
+            except:
+                break  # try next symbol
     return None
 
 
 def get_current_price(exchange_name, coin):
-    """v27: Get price with retry."""
+    """v27: Get price with retry + futures."""
     import ccxt as _ccxt
-    for _attempt in range(3):
-        try:
-            ex, actual = _get_exchange(exchange_name)
-            if ex is None: return None
-            ticker = ex.fetch_ticker(f"{coin}/USDT")
-            return ticker['last']
-        except (_ccxt.NetworkError, _ccxt.RequestTimeout, _ccxt.ExchangeNotAvailable):
-            time.sleep([2, 5, 15][_attempt])
-        except:
-            return None
+    symbols = [f"{coin}/USDT:USDT", f"{coin}/USDT"]
+    for symbol in symbols:
+        for _attempt in range(3):
+            try:
+                ex, actual = _get_exchange(exchange_name)
+                if ex is None: return None
+                ticker = ex.fetch_ticker(symbol)
+                return ticker['last']
+            except (_ccxt.NetworkError, _ccxt.RequestTimeout, _ccxt.ExchangeNotAvailable):
+                time.sleep([2, 5, 15][_attempt])
+            except:
+                break
     return None
 
 
@@ -706,7 +731,8 @@ def monitor_position(pos, exchange_name):
             f"🚨 НАПРАВЛЕНИЕ ИНВЕРТИРОВАНО: Entry_Z={entry_z:+.2f} (положительный) "
             f"но Dir=LONG. Для Z>0 должен быть SHORT! Проверьте ввод.")
     
-    return {
+    # Build base result dict
+    base_result = {
         'z_now': z_now,
         'z_entry': pos['entry_z'],
         'pnl_pct': pnl_pct,
@@ -727,19 +753,46 @@ def monitor_position(pos, exchange_name):
         'hr_series': kf['hrs'],
         'halflife_hours': hl_hours,
         'z_window': zw,
-        # v3.0: quality metrics
         'hurst': hurst,
         'correlation': corr,
         'pvalue': pvalue,
         'quality_data': quality_data,
         'quality_warnings': quality_warnings,
-        # v18: GARCH Z
         'z_garch': z_garch,
         'garch_vol_ratio': garch_vol_ratio,
         'garch_var_expanding': garch_var_expanding,
     }
     
-    # v24: R5 Smart Exit Analysis
+    # v27: R6 Correlation Monitor — track quality degradation
+    _pair_key = f"{pos['coin1']}/{pos['coin2']}"
+    _qh_key = f"_quality_history_{pos['id']}"
+    if _qh_key not in st.session_state:
+        st.session_state[_qh_key] = []
+    _qh = st.session_state[_qh_key]
+    _qh.append({'ts': time.time(), 'corr': corr, 'hurst': hurst, 'pval': pvalue})
+    if len(_qh) > 30:
+        st.session_state[_qh_key] = _qh[-30:]
+    
+    # R6: Quality degradation alerts
+    if len(_qh) >= 3:
+        _recent_corr = [q['corr'] for q in _qh[-5:]]
+        _recent_hurst = [q['hurst'] for q in _qh[-5:]]
+        _corr_trend = _recent_corr[-1] - _recent_corr[0] if len(_recent_corr) > 1 else 0
+        _hurst_trend = _recent_hurst[-1] - _recent_hurst[0] if len(_recent_hurst) > 1 else 0
+        
+        if _corr_trend < -0.1:
+            quality_warnings.append(f"📉 R6: ρ падает ({_recent_corr[0]:.2f}→{_recent_corr[-1]:.2f}). Хедж деградирует!")
+        if _hurst_trend > 0.05:
+            quality_warnings.append(f"📈 R6: Hurst растёт ({_recent_hurst[0]:.3f}→{_recent_hurst[-1]:.3f}). MR ослабевает!")
+    
+    base_result['quality_warnings'] = quality_warnings
+    
+    # v24: R5 Smart Exit Analysis (was dead code — FIXED in v27)
+    base_result['smart_exit'] = None
+    base_result['smart_signals'] = []
+    base_result['smart_recommendation'] = ''
+    base_result['smart_urgency'] = 0
+    
     if _USE_MRA:
         try:
             smart_exit = smart_exit_analysis(
@@ -752,67 +805,21 @@ def monitor_position(pos, exchange_name):
                 direction=pos['direction'],
                 best_pnl=pos.get('best_pnl', max(pnl_pct, 0)),
             )
-            result_dict = {**{k: v for k, v in locals().items() 
-                            if k in ('z_now', 'z_garch', 'garch_vol_ratio', 'garch_var_expanding',
-                                    'pnl_pct', 'spread_direction', 'z_towards_zero',
-                                    'pnl_z_disagree', 'pnl_z_warning', 'exit_signal',
-                                    'exit_urgency', 'hours_in', 'hl_hours', 'hurst',
-                                    'corr', 'pvalue', 'quality_data', 'quality_warnings')}}
-            # Merge smart exit signals
-            result_dict = {
-                'z_now': z_now, 'z_entry': pos['entry_z'],
-                'pnl_pct': pnl_pct, 'spread_direction': spread_direction,
-                'z_towards_zero': z_towards_zero,
-                'pnl_z_disagree': pnl_z_disagree, 'pnl_z_warning': pnl_z_warning,
-                'price1_now': p1[-1], 'price2_now': p2[-1],
-                'hr_now': hr_current, 'hr_entry': pos['entry_hr'],
-                'exit_signal': exit_signal, 'exit_urgency': exit_urgency,
-                'hours_in': hours_in, 'spread': spread,
-                'zscore_series': zs, 'timestamps': ts,
-                'hr_series': kf['hrs'], 'halflife_hours': hl_hours,
-                'z_window': zw, 'hurst': hurst, 'correlation': corr,
-                'pvalue': pvalue, 'quality_data': quality_data,
-                'quality_warnings': quality_warnings,
-                'z_garch': z_garch, 'garch_vol_ratio': garch_vol_ratio,
-                'garch_var_expanding': garch_var_expanding,
-                # R5 Smart Exit
-                'smart_exit': smart_exit,
-                'smart_signals': smart_exit.get('signals', []),
-                'smart_recommendation': smart_exit.get('recommendation', ''),
-                'smart_urgency': smart_exit.get('urgency', 0),
-            }
+            base_result['smart_exit'] = smart_exit
+            base_result['smart_signals'] = smart_exit.get('signals', [])
+            base_result['smart_recommendation'] = smart_exit.get('recommendation', '')
+            base_result['smart_urgency'] = smart_exit.get('urgency', 0)
             
             # Override exit_signal if smart exit has higher urgency
             if smart_exit.get('urgency', 0) > exit_urgency:
-                result_dict['exit_urgency'] = smart_exit['urgency']
-                # Combine signals
+                base_result['exit_urgency'] = smart_exit['urgency']
                 smart_msgs = [s['message'] for s in smart_exit.get('signals', [])]
                 if smart_msgs:
-                    result_dict['exit_signal'] = ' | '.join(smart_msgs[:2])
-            
-            return result_dict
+                    base_result['exit_signal'] = ' | '.join(smart_msgs[:2])
         except Exception:
             pass
     
-    return {
-        'z_now': z_now, 'z_entry': pos['entry_z'],
-        'pnl_pct': pnl_pct, 'spread_direction': spread_direction,
-        'z_towards_zero': z_towards_zero,
-        'pnl_z_disagree': pnl_z_disagree, 'pnl_z_warning': pnl_z_warning,
-        'price1_now': p1[-1], 'price2_now': p2[-1],
-        'hr_now': hr_current, 'hr_entry': pos['entry_hr'],
-        'exit_signal': exit_signal, 'exit_urgency': exit_urgency,
-        'hours_in': hours_in, 'spread': spread,
-        'zscore_series': zs, 'timestamps': ts,
-        'hr_series': kf['hrs'], 'halflife_hours': hl_hours,
-        'z_window': zw, 'hurst': hurst, 'correlation': corr,
-        'pvalue': pvalue, 'quality_data': quality_data,
-        'quality_warnings': quality_warnings,
-        'z_garch': z_garch, 'garch_vol_ratio': garch_vol_ratio,
-        'garch_var_expanding': garch_var_expanding,
-        'smart_exit': None, 'smart_signals': [],
-        'smart_recommendation': '', 'smart_urgency': 0,
-    }
+    return base_result
 
 
 # ═══════════════════════════════════════════════════════
@@ -846,6 +853,28 @@ with st.sidebar:
     # v22: R3 — Auto-Import from Scanner
     import glob, json as _json
     pending_files = sorted(glob.glob("monitor_import/pending_*.json"))
+    
+    # v27: Cleanup — remove pending files if pair already open
+    if pending_files:
+        _open_pairs = set()
+        for _op in load_positions():
+            if _op.get('status') == 'OPEN':
+                _open_pairs.add(f"{_op['coin1']}/{_op['coin2']}")
+        
+        _remaining = []
+        for pf in pending_files:
+            try:
+                with open(pf, 'r') as f:
+                    imp = _json.load(f)
+                _pname = f"{imp['coin1']}/{imp['coin2']}"
+                if _pname in _open_pairs:
+                    import os; os.remove(pf)  # Already imported
+                else:
+                    _remaining.append(pf)
+            except Exception:
+                _remaining.append(pf)
+        pending_files = _remaining
+    
     if pending_files:
         st.markdown("#### 📥 Импорт из сканера")
         for pf in pending_files:
