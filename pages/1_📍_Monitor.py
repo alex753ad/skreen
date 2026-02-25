@@ -58,6 +58,22 @@ try:
 except ImportError:
     _USE_MRA = False
 
+
+# v30: Telegram helper for exit alerts
+def send_telegram(token, chat_id, message):
+    """Simple Telegram send — shared with scanner."""
+    import urllib.request, urllib.parse
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = urllib.parse.urlencode({
+            'chat_id': chat_id, 'text': message, 'parse_mode': 'HTML'
+        }).encode()
+        req = urllib.request.Request(url, data=data)
+        resp = urllib.request.urlopen(req, timeout=10)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
 # v5.3: assess_entry_readiness — imported from analysis module when available
 # Local fallback always defined (used when analysis module unavailable)
 
@@ -847,6 +863,17 @@ with st.sidebar:
                            help="⚠️ Binance/Bybit заблокированы на облачных серверах. Используйте OKX/KuCoin.")
     auto_refresh = st.checkbox("Авто-обновление (2 мин)", value=False)
     
+    # v30: Telegram exit alerts
+    st.markdown("---")
+    st.caption("📱 **Telegram** — настройки берутся из сканера (общий session_state)")
+    if 'tg_token' not in st.session_state:
+        _tg_t = st.text_input("TG Bot Token", type="password", key='tg_token_mon')
+        if _tg_t: st.session_state['tg_token'] = _tg_t
+        _tg_c = st.text_input("TG Chat ID", key='tg_chat_mon')
+        if _tg_c: st.session_state['tg_chat_id'] = _tg_c
+        st.session_state['tg_enabled'] = st.checkbox("TG включён", key='tg_en_mon')
+        st.session_state['tg_alert_exits'] = st.checkbox("Алерты выхода", value=True, key='tg_ex_mon')
+    
     st.divider()
     st.header("➕ Новая позиция")
     
@@ -1054,6 +1081,27 @@ with tab1:
                         st.success(mon['exit_signal'])
                     else:
                         st.warning(mon['exit_signal'])
+                    
+                    # v30: Telegram exit alert
+                    _tg_exit_key = f"_tg_exit_sent_{pos['id']}"
+                    if (st.session_state.get('tg_enabled') and 
+                        st.session_state.get('tg_alert_exits', True) and
+                        not st.session_state.get(_tg_exit_key)):
+                        try:
+                            _tg_tok = st.session_state.get('tg_token', '')
+                            _tg_cid = st.session_state.get('tg_chat_id', '')
+                            if _tg_tok and _tg_cid:
+                                _exit_msg = (
+                                    f"📤 <b>Exit Signal</b> — {pair_name}\n"
+                                    f"⏰ {now_msk().strftime('%H:%M МСК')}\n"
+                                    f"📍 {pos['direction']} | Z: {pos['entry_z']:+.2f} → {mon['z_now']:+.2f}\n"
+                                    f"💰 P&L: {mon['pnl_pct']:+.2f}%\n"
+                                    f"⚠️ {mon['exit_signal']}"
+                                )
+                                send_telegram(_tg_tok, _tg_cid, _exit_msg)
+                                st.session_state[_tg_exit_key] = True
+                        except Exception:
+                            pass
                 
                 # v24: R5 Smart Exit Signals panel
                 smart_sigs = mon.get('smart_signals', [])
@@ -1075,6 +1123,20 @@ with tab1:
                 dir_emoji_c2 = '🔴 SHORT' if pos['direction'] == 'LONG' else '🟢 LONG'
                 st.subheader(f"{dir_emoji} {pos['direction']} | {pair_name} | #{pos['id']}")
                 st.caption(f"{pos['coin1']}: {dir_emoji_c1} | {pos['coin2']}: {dir_emoji_c2}")
+                
+                # v30: Show trade basis — auto vs manual, signal type
+                _is_auto = pos.get('auto_opened', False)
+                _sig_type = pos.get('signal_type', '')
+                _entry_lbl = pos.get('entry_label', '')
+                if _is_auto or _sig_type:
+                    _basis_parts = []
+                    if _is_auto: _basis_parts.append("🤖 АВТО")
+                    else: _basis_parts.append("👤 РУЧНОЙ")
+                    if _sig_type: _basis_parts.append(f"📊 {_sig_type}")
+                    if _entry_lbl: _basis_parts.append(_entry_lbl)
+                    _ml_g = pos.get('ml_grade', '')
+                    if _ml_g: _basis_parts.append(f"🧠 {_ml_g}")
+                    st.caption(" | ".join(_basis_parts))
                 
                 # v4.0: P&L / Z disagreement warning
                 if mon.get('pnl_z_disagree'):
@@ -1296,6 +1358,10 @@ with tab1:
                 'Пара': f"{pos['coin1']}/{pos['coin2']}",
                 'Dir': pos['direction'],
                 'TF': pos['timeframe'],
+                # v30: Trade basis
+                'Основание': ('🤖' if pos.get('auto_opened') else '👤') + 
+                             (f" {pos.get('signal_type','')}" if pos.get('signal_type') else '') +
+                             (f" {pos.get('entry_label','')}" if pos.get('entry_label') else ''),
                 'Entry_Z': pos['entry_z'],
                 'Entry_HR': pos.get('entry_hr', 0),
                 'Stop_Z': pos.get('stop_z', 4.0),
@@ -1366,11 +1432,18 @@ with tab2:
         # Table
         rows = []
         for p in reversed(closed_positions):
+            # v30: Trade basis
+            _basis = '👤' if not p.get('auto_opened') else '🤖'
+            _sig = p.get('signal_type', '')
+            _lbl = p.get('entry_label', '')
+            if _sig: _basis += f" {_sig}"
+            if _lbl and len(_lbl) < 15: _basis += f" {_lbl}"
+            
             rows.append({
                 '#': p['id'],
                 'Пара': f"{p['coin1']}/{p['coin2']}",
                 'Dir': p['direction'],
-                'TF': p['timeframe'],
+                'Основание': _basis,
                 'Entry Z': f"{p['entry_z']:+.2f}",
                 'Exit Z': f"{p.get('exit_z', 0):+.2f}",
                 'P&L %': f"{p.get('pnl_pct', 0):+.2f}",
@@ -1379,6 +1452,63 @@ with tab2:
                 'Выход': p.get('exit_time', '')[:16] if p.get('exit_time') else '',
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        
+        # v30: 3.3 Pattern Analysis
+        try:
+            from config_loader import pattern_analysis, pattern_summary
+            _pa = pattern_analysis()
+            if not _pa.get('error') and _pa.get('n_trades', 0) >= 3:
+                with st.expander(f"🔬 Pattern Analysis ({_pa['n_trades']} сделок)", expanded=False):
+                    pa1, pa2, pa3 = st.columns(3)
+                    
+                    # Direction
+                    with pa1:
+                        st.markdown("**По направлению**")
+                        for d, v in _pa.get('by_direction', {}).items():
+                            if v['n'] > 0:
+                                _e = '🟢' if v['avg'] > 0 else '🔴'
+                                st.caption(f"{_e} {d}: {v['n']} шт, WR={v['wr']:.0f}%, avg={v['avg']:+.2f}%")
+                    
+                    # Z-range
+                    with pa2:
+                        st.markdown("**По Z-score при входе**")
+                        for rng, v in _pa.get('by_z_range', {}).items():
+                            _e = '🟢' if v['avg'] > 0 else '🔴'
+                            st.caption(f"{_e} Z={rng}: {v['n']} шт, WR={v['wr']:.0f}%, avg={v['avg']:+.2f}%")
+                    
+                    # Hold time
+                    with pa3:
+                        st.markdown("**По времени удержания**")
+                        for h, v in _pa.get('by_hold', {}).items():
+                            _e = '🟢' if v['avg'] > 0 else '🔴'
+                            st.caption(f"{_e} {h}: {v['n']} шт, WR={v['wr']:.0f}%, avg={v['avg']:+.2f}%")
+                    
+                    # Auto vs Manual
+                    _avm = _pa.get('auto_vs_manual', {})
+                    if _avm.get('auto', {}).get('n', 0) > 0 and _avm.get('manual', {}).get('n', 0) > 0:
+                        st.markdown("**🤖 Авто vs 👤 Ручной**")
+                        _a = _avm['auto']
+                        _m = _avm['manual']
+                        st.caption(f"🤖 Авто: {_a['n']} шт, WR={_a['wr']:.0f}%, avg={_a['avg']:+.2f}% | "
+                                  f"👤 Ручной: {_m['n']} шт, WR={_m['wr']:.0f}%, avg={_m['avg']:+.2f}%")
+                    
+                    # Winner/Loser profile
+                    wp = _pa.get('winner_profile')
+                    lp = _pa.get('loser_profile')
+                    if wp and lp:
+                        st.markdown("**Профиль сделок**")
+                        st.caption(f"✅ Профитные: avg |Z|={wp['avg_z']}, hold={wp['avg_hold']:.1f}ч")
+                        st.caption(f"❌ Убыточные: avg |Z|={lp['avg_z']}, hold={lp['avg_hold']:.1f}ч")
+                    
+                    # Top pairs
+                    _bp = _pa.get('by_pair', {})
+                    if _bp:
+                        st.markdown("**Топ пары**")
+                        for pair, v in list(_bp.items())[:5]:
+                            _e = '🟢' if v['total'] > 0 else '🔴'
+                            st.caption(f"{_e} {pair}: {v['n']} шт, total={v['total']:+.2f}%, WR={v['wr']:.0f}%")
+        except Exception:
+            pass
         
         # v5.1: CSV export with date in filename
         csv_history = pd.DataFrame(rows).to_csv(index=False)
