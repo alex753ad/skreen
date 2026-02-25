@@ -89,6 +89,13 @@ def kalman_hr(s1, s2, delta=1e-4, ve=1e-3):
     if _USE_MRA:
         result = _mra_kalman(s1, s2, delta=delta, ve=ve)
         if result is not None:
+            # v27: Normalize keys — MRA returns 'hedge_ratios', we need 'hrs'
+            if 'hedge_ratios' in result and 'hrs' not in result:
+                result['hrs'] = result['hedge_ratios']
+            if 'hr_final' in result and 'hr' not in result:
+                result['hr'] = result['hr_final']
+            if 'intercept_final' in result and 'intercept' not in result:
+                result['intercept'] = result['intercept_final']
             return result
     # Local fallback
     s1, s2 = np.array(s1, float), np.array(s2, float)
@@ -677,8 +684,18 @@ if mode == "🔍 Одна пара":
             limit = lookback_days * hpb_map.get(timeframe, 6)
             
             try:
-                ohlcv1 = ex.fetch_ohlcv(f"{coin1}/USDT", timeframe, limit=limit)
-                ohlcv2 = ex.fetch_ohlcv(f"{coin2}/USDT", timeframe, limit=limit)
+                # v27: Retry on network errors
+                import ccxt as _ccxt
+                ohlcv1, ohlcv2 = None, None
+                for _att in range(3):
+                    try:
+                        ohlcv1 = ex.fetch_ohlcv(f"{coin1}/USDT", timeframe, limit=limit)
+                        ohlcv2 = ex.fetch_ohlcv(f"{coin2}/USDT", timeframe, limit=limit)
+                        break
+                    except (_ccxt.NetworkError, _ccxt.RequestTimeout, _ccxt.ExchangeNotAvailable):
+                        import time as _t; _t.sleep([2, 5, 15][_att])
+                if ohlcv1 is None or ohlcv2 is None:
+                    st.error("❌ Не удалось загрузить данные после 3 попыток"); st.stop()
                 df1 = pd.DataFrame(ohlcv1, columns=['ts','o','h','l','c','v'])
                 df2 = pd.DataFrame(ohlcv2, columns=['ts','o','h','l','c','v'])
                 df1['ts'] = pd.to_datetime(df1['ts'], unit='ms')
@@ -824,13 +841,18 @@ elif mode == "🔄 Автоскан":
         
         prices = {}
         prog = st.progress(0, "Данные...")
+        import ccxt as _ccxt
         for i, coin in enumerate(coins):
             prog.progress((i+1)/len(coins), f"📥 {coin}")
-            try:
-                ohlcv = ex.fetch_ohlcv(f"{coin}/USDT", timeframe, limit=limit)
-                df = pd.DataFrame(ohlcv, columns=['ts','o','h','l','c','v'])
-                if len(df) >= 100: prices[coin] = df['c'].values
-            except: continue
+            for _att in range(2):
+                try:
+                    ohlcv = ex.fetch_ohlcv(f"{coin}/USDT", timeframe, limit=limit)
+                    df = pd.DataFrame(ohlcv, columns=['ts','o','h','l','c','v'])
+                    if len(df) >= 100: prices[coin] = df['c'].values
+                    break
+                except (_ccxt.NetworkError, _ccxt.RequestTimeout):
+                    import time as _t; _t.sleep(3)
+                except: break
         prog.empty()
         
         # Cointegration scan with FDR correction (v7.0)
@@ -934,4 +956,3 @@ elif mode == "🔄 Автоскан":
 
 st.divider()
 st.caption("⚠️ Только для образовательных целей. Не является финансовой рекомендацией.")
-
