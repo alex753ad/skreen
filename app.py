@@ -202,7 +202,7 @@ def send_telegram_test(token, chat_id):
     return send_telegram(token, chat_id, msg)
 
 def format_telegram_signal(pairs_list, timeframe, exchange):
-    """Format SIGNAL pairs for Telegram — v27: matches trade TXT format."""
+    """Format SIGNAL pairs for Telegram — v28: matches trade TXT format with ML score."""
     if not pairs_list:
         return None
     lines = [f"🔔 <b>Pairs Scanner Alert</b>"]
@@ -217,24 +217,34 @@ def format_telegram_signal(pairs_list, timeframe, exchange):
         hl = p.get('halflife_hours', 0)
         hurst = p.get('hurst', 0)
         mbt_q = p.get('mbt_quick', 0)
-        mbt_pnl = p.get('mbt_avg_pnl', 0)
+        mbt_pnl = p.get('mbt_pnl', 0)
         entry = p.get('_entry_label', p.get('signal', ''))
         mtf = '✅' if p.get('mtf_confirmed') else '❌'
+        fr_net = p.get('funding_net', 0)
+        
+        # ML score
+        try:
+            from config_loader import ml_score
+            _ml = ml_score(p)
+            ml_str = f"ML:{_ml['grade']}({_ml['score']:.0f})"
+        except Exception:
+            ml_str = ""
         
         if d == 'SHORT':
             c1_act, c2_act = 'SELL', 'BUY'
         else:
             c1_act, c2_act = 'BUY', 'SELL'
         
-        emoji = '🟢' if '🟢' in entry else '🟡' if '🟡' in entry else '⚪'
+        emoji = '🟢' if '🟢' in str(entry) else '🟡' if '🟡' in str(entry) else '⚪'
+        fr_str = f"FR={fr_net:+.3f}%" if fr_net != 0 else ""
         
         lines.append(
             f"{'═'*20}\n"
             f"{emoji} <b>{c1}/{c2} {d}</b> {entry}\n"
-            f"  {c1}/USDT → {c1_act} | {c2}/USDT → {c2_act}\n"
+            f"  {c1}/USDT:USDT → {c1_act} | {c2}/USDT:USDT → {c2_act}\n"
             f"  Z={z:+.2f} | HR={hr:.4f} | HL={hl:.0f}ч\n"
-            f"  H={hurst:.3f} | μBT={mbt_q:.0f}% ({mbt_pnl:+.2f}%)\n"
-            f"  MTF:{mtf} | Q={p.get('quality_score',0)}"
+            f"  H={hurst:.3f} | μBT={mbt_q:.0f}% ({mbt_pnl:+.3f}%)\n"
+            f"  MTF:{mtf} | Q={p.get('quality_score',0)} | {ml_str} {fr_str}"
         )
     return "\n".join(lines)
 
@@ -389,42 +399,46 @@ class CryptoPairsScanner:
         """Получить топ монет по объему торгов (FUTURES/SWAP)"""
         try:
             markets = self.exchange.load_markets()
-            tickers = self.exchange.fetch_tickers({'type': 'swap'})
             
-            # v27: FUTURES — используем swap perpetual (/USDT:USDT)
+            # v28: Try futures tickers, fallback to all tickers + filter
+            try:
+                self.exchange.options['defaultType'] = 'swap'
+                tickers = self.exchange.fetch_tickers()
+                self.exchange.options['defaultType'] = 'spot'  # restore
+            except Exception:
+                tickers = self.exchange.fetch_tickers()
+            
+            # v28: FUTURES — collect swap perpetual (/USDT:USDT) AND spot (/USDT)
             base_currency = 'USDT'
-            swap_pairs = {}
-            for k, v in tickers.items():
-                # Swap format: BTC/USDT:USDT
-                if f'/{base_currency}:USDT' in k:
-                    swap_pairs[k] = v
-                # Spot fallback: BTC/USDT (no colon) — include if no swaps found
-                elif f'/{base_currency}' in k and ':' not in k and not swap_pairs:
-                    swap_pairs[k] = v
-            
-            # Сортируем по объему
             valid_pairs = []
-            for symbol, ticker in swap_pairs.items():
+            seen_coins = set()
+            
+            for k, v in tickers.items():
                 try:
-                    volume = float(ticker.get('quoteVolume', 0)) or float(ticker.get('volume', 0))
+                    coin = k.split('/')[0]
+                    if coin in seen_coins:
+                        continue
+                    # Prefer swap format: BTC/USDT:USDT
+                    is_swap = f':{base_currency}' in k
+                    is_spot = f'/{base_currency}' in k and ':' not in k
+                    if not is_swap and not is_spot:
+                        continue
+                    volume = float(v.get('quoteVolume', 0) or v.get('volume', 0) or 0)
                     if volume > 0:
-                        valid_pairs.append((symbol, volume))
+                        valid_pairs.append((coin, volume, is_swap))
+                        seen_coins.add(coin)
                 except:
                     continue
             
             # Сортируем по объему
             sorted_pairs = sorted(valid_pairs, key=lambda x: x[1], reverse=True)
             
-            # Берем топ монет — strip swap suffix (:USDT)
-            top_coins = []
-            for pair in sorted_pairs[:limit]:
-                sym = pair[0]  # e.g. BTC/USDT:USDT
-                coin = sym.split('/')[0]  # BTC
-                if coin not in top_coins:
-                    top_coins.append(coin)
+            # Берем топ монет
+            top_coins = [pair[0] for pair in sorted_pairs[:limit]]
             
             if len(top_coins) > 0:
-                st.info(f"📊 Загружено {len(top_coins)} монет (futures) с {self.exchange_name.upper()}")
+                _n_swap = sum(1 for p in sorted_pairs[:limit] if p[2])
+                st.info(f"📊 {len(top_coins)} монет ({_n_swap} futures + {len(top_coins)-_n_swap} spot) с {self.exchange_name.upper()}")
                 return top_coins
             else:
                 raise Exception("Не удалось получить данные о монетах")
@@ -1731,9 +1745,27 @@ with st.sidebar:
     
     # v10.0: Multi-Timeframe Confirmation
     st.markdown("---")
+    
+    # v30: Auto-Monitor
+    st.subheader("🤖 Авто-Монитор")
+    auto_monitor = st.checkbox(
+        "Авто-открытие позиций (SIGNAL/READY)",
+        value=True, key='auto_monitor',
+        help="Автоматически отслеживать SIGNAL и READY пары в мониторе для наработки истории"
+    )
+    st.caption("📍 Пары из сканера автоматически отслеживаются в мониторе. "
+              "Открытие реальных сделок — вручную на ваше усмотрение.")
+    
+    st.markdown("---")
     st.subheader("📱 Telegram уведомления")
     tg_enabled = st.checkbox("Включить Telegram", value=False, key='tg_enabled',
                              help="Получайте пуш при новом 🟢 SIGNAL")
+    
+    # v30: Alert types
+    tg_alert_signals = st.checkbox("🔔 Новые сигналы", value=True, key='tg_alert_signals')
+    tg_alert_exits = st.checkbox("📤 Сигналы выхода", value=True, key='tg_alert_exits')
+    tg_alert_quality = st.checkbox("⚠️ Деградация качества", value=False, key='tg_alert_quality')
+    
     tg_token = st.text_input("Bot Token", 
                              value="8477333196:AAGoaiUPn6VyY92UbTNQ7AhjNbSgv2SFfmc",
                              type="password", key='tg_token',
@@ -2034,33 +2066,119 @@ if _do_scan:
             except Exception as ex:
                 st.toast(f"⚠️ Auto-export: {ex}", icon="⚠️")  # v7.1: КРИТИЧНО — без этого выбор пары перезапускает скан
             
-            # v13.0: Telegram notification — sends on every scan cycle
+            # v30: Enhanced Telegram — multiple alert types
             tg_token = st.session_state.get('tg_token', '')
             tg_chat = st.session_state.get('tg_chat_id', '')
             if st.session_state.get('tg_enabled') and tg_token and tg_chat and pairs_results:
-                signal_pairs = [p for p in pairs_results 
-                               if p.get('_entry_level') == 'ENTRY'
-                               and not p.get('cusum_break', False)]
-                # Track previous signals to only notify on NEW ones
-                prev_signals = st.session_state.get('_prev_signal_pairs', set())
-                new_signals = [p for p in signal_pairs 
-                              if p.get('pair') not in prev_signals]
-                st.session_state['_prev_signal_pairs'] = {
-                    p.get('pair') for p in signal_pairs}
+                # Signal alerts
+                if st.session_state.get('tg_alert_signals', True):
+                    signal_pairs = [p for p in pairs_results 
+                                   if p.get('signal') in ('SIGNAL', 'READY')
+                                   and p.get('direction', 'NONE') != 'NONE']
+                    prev_signals = st.session_state.get('_prev_signal_pairs', set())
+                    new_signals = [p for p in signal_pairs 
+                                  if p.get('pair') not in prev_signals]
+                    st.session_state['_prev_signal_pairs'] = {
+                        p.get('pair') for p in signal_pairs}
+                    
+                    if new_signals:
+                        msg = format_telegram_signal(new_signals, timeframe, exchange)
+                        if msg:
+                            ok, err = send_telegram(tg_token, tg_chat, msg)
+                            if ok:
+                                st.toast(f"📱 TG: {len(new_signals)} сигналов")
                 
-                if new_signals:
-                    msg = format_telegram_signal(new_signals, timeframe, exchange)
-                    if msg:
-                        ok, err = send_telegram(tg_token, tg_chat, msg)
-                        if ok:
-                            st.toast(f"📱 TG: {len(new_signals)} новых сигналов отправлено")
-                        else:
-                            st.toast(f"⚠️ TG: {err}", icon="⚠️")
+                # Vanished signals (was SIGNAL → now gone)
+                _vanished = prev_signals - {p.get('pair') for p in signal_pairs}
+                if _vanished and st.session_state.get('tg_alert_exits', True):
+                    _van_msg = (f"📤 <b>Сигналы исчезли</b>\n"
+                               f"⏰ {now_msk().strftime('%H:%M МСК')}\n\n"
+                               + "\n".join(f"❌ {v}" for v in _vanished))
+                    send_telegram(tg_token, tg_chat, _van_msg)
             
             # v20: auto-refresh moved to END of script (after display)
             # Old code had st.rerun() here — table NEVER rendered on refresh!
             # v25: Set timestamp AFTER scan completes (not before!)
             st.session_state['_last_scan_ts'] = time.time()
+            
+            # ═══ v30: AUTO-OPEN positions for SIGNAL/READY pairs ═══
+            if st.session_state.get('auto_monitor', True) and pairs_results:
+                try:
+                    import json as _json
+                    _pos_file = "positions.json"
+                    _existing = []
+                    if os.path.exists(_pos_file):
+                        with open(_pos_file) as f:
+                            _existing = _json.load(f)
+                    _open_pairs = {f"{p['coin1']}/{p['coin2']}" 
+                                   for p in _existing if p.get('status') == 'OPEN'}
+                    
+                    _auto_count = 0
+                    for p in pairs_results:
+                        if p.get('signal') not in ('SIGNAL', 'READY'):
+                            continue
+                        if p.get('direction', 'NONE') == 'NONE':
+                            continue
+                        _pair_name = p['pair']
+                        if _pair_name in _open_pairs:
+                            continue
+                        
+                        # Get prices
+                        _p1 = p.get('price1_last', 0)
+                        _p2 = p.get('price2_last', 0)
+                        if _p1 <= 0 or _p2 <= 0:
+                            continue
+                        
+                        # ML score for notes
+                        try:
+                            from config_loader import ml_score as _ml_fn
+                            _ml_r = _ml_fn(p)
+                            _ml_str = f"ML:{_ml_r['grade']}{_ml_r['score']:.0f}"
+                        except:
+                            _ml_str = ""
+                        
+                        _stop_offset = CFG('strategy', 'stop_z_offset', 2.0)
+                        _min_stop = CFG('strategy', 'min_stop_z', 4.0)
+                        _ez = p['zscore']
+                        _adaptive_stop = max(abs(_ez) + _stop_offset, _min_stop)
+                        
+                        _new_pos = {
+                            'id': len(_existing) + 1,
+                            'coin1': p['coin1'], 'coin2': p['coin2'],
+                            'direction': p.get('direction'),
+                            'entry_z': round(_ez, 4),
+                            'entry_hr': round(p['hedge_ratio'], 6),
+                            'entry_price1': round(_p1, 6),
+                            'entry_price2': round(_p2, 6),
+                            'entry_time': now_msk().isoformat(),
+                            'timeframe': timeframe,
+                            'status': 'OPEN',
+                            'notes': (f"AUTO | {p.get('signal','')} | "
+                                     f"{p.get('_entry_label','')} | "
+                                     f"Q={p.get('quality_score',0)} "
+                                     f"H={p.get('hurst',0):.3f} "
+                                     f"μBT={p.get('mbt_quick',0):.0f}% "
+                                     f"{_ml_str}"),
+                            'exit_z_target': CFG('monitor', 'exit_z_target', 0.5),
+                            'stop_z': _adaptive_stop,
+                            'max_hold_hours': CFG('strategy', 'max_hold_hours', 72),
+                            'pnl_stop_pct': CFG('monitor', 'pnl_stop_pct', -5.0),
+                            # v30: Auto-open metadata
+                            'auto_opened': True,
+                            'signal_type': p.get('signal', ''),
+                            'entry_label': p.get('_entry_label', ''),
+                            'ml_grade': _ml_str,
+                        }
+                        _existing.append(_new_pos)
+                        _open_pairs.add(_pair_name)
+                        _auto_count += 1
+                    
+                    if _auto_count > 0:
+                        with open(_pos_file, 'w') as f:
+                            _json.dump(_existing, f, indent=2, default=str)
+                        st.toast(f"🤖 Auto-monitor: {_auto_count} пар добавлено", icon="📍")
+                except Exception as _ae:
+                    st.toast(f"⚠️ Auto-monitor: {_ae}", icon="⚠️")
             
     except Exception as e:
         st.error(f"❌ Ошибка: {e}")
@@ -2256,6 +2374,13 @@ if st.session_state.pairs_data is not None:
         for p in pairs:
             try:
                 hl_h = p.get('halflife_hours', p.get('halflife_days', 1) * 24)
+                # v28: ML scoring for table
+                try:
+                    from config_loader import ml_score as _ml_fn
+                    _ml_r = _ml_fn(p)
+                    _ml_grade_for_table = f"{_ml_r['grade']}{_ml_r['score']:.0f}"
+                except Exception:
+                    _ml_grade_for_table = '—'
                 df_rows.append({
                     'Пара': p.get('pair', '?'),
                     'Вход': p.get('_entry_label', '⚪ ЖДАТЬ'),
@@ -2307,6 +2432,11 @@ if st.session_state.pairs_data is not None:
                     'PCA': (f"{'✅' if p.get('pca_same_cluster') else '⚠️'}"
                             f" {p.get('pca_market_neutral', 0):.0%}"
                             if p.get('pca_market_neutral', 0) > 0 else '—'),
+                    # v28: Funding rate net
+                    'FR': (f"{p.get('funding_net', 0):+.3f}%"
+                           if p.get('funding_net', 0) != 0 else '—'),
+                    # v28: ML Score
+                    'ML': _ml_grade_for_table,
                 })
             except Exception as e:
                 # Log error instead of silently dropping row
@@ -2316,13 +2446,13 @@ if st.session_state.pairs_data is not None:
                     'Q': 0, 'S': 0, 'Conf': '', 'Z': 0, 'Thr': 0,
                     'FDR': '', 'Hurst': 0, 'H↕': '', 'Stab': '', 'HL': '',
                     'HR': 0, 'ρ': 0, 'Opt': '', 'Regime': '',
-                    'CUSUM': '', 'Joh': '', 'BT': '', 'μBT': '', 'V↕': '', 'WF': '', 'Конфл': '', 'PCA': '',
+                    'CUSUM': '', 'Joh': '', 'BT': '', 'μBT': '', 'V↕': '', 'WF': '', 'Конфл': '', 'PCA': '', 'FR': '', 'ML': '',
                 })
         df_display = pd.DataFrame(df_rows) if df_rows else pd.DataFrame()
     else:
         df_display = pd.DataFrame(columns=[
             'Пара', 'Вход', 'Статус', 'Dir', 'MTF', 'Q', 'S', 'Conf', 'Z', 'Thr',
-            'FDR', 'Hurst', 'Stab', 'HL', 'HR', 'ρ', 'Opt'
+            'FDR', 'Hurst', 'Stab', 'HL', 'HR', 'ρ', 'Opt', 'FR', 'ML'
         ])
     
     # Функция для отображения таблицы
@@ -3309,9 +3439,36 @@ if st.session_state.pairs_data is not None:
         if _warnings:
             st.warning(" | ".join(_warnings))
         
+        # === R7 ML SCORING ===
+        try:
+            from config_loader import ml_score, risk_position_size
+            _ml = ml_score(selected_data)
+            _grade_emoji = {'A': '🟢', 'B': '🔵', 'C': '🟡', 'D': '🟠', 'F': '🔴'}
+            
+            _ml_col1, _ml_col2 = st.columns([1, 2])
+            with _ml_col1:
+                st.metric("ML Score", f"{_ml['score']:.0f}/100",
+                         f"Grade {_ml['grade']} — {_ml['recommendation']}")
+            with _ml_col2:
+                _factors_str = " | ".join(f"{k}={v}" for k, v in _ml['factors'].items() if v != 0)
+                st.caption(f"📊 {_factors_str}")
+            
+            # === R10 RISK MANAGER ===
+            _portfolio = CFG('risk', 'portfolio_usdt', 1000)
+            _n_open = len([p for p in (st.session_state.get('_all_open_pairs', []))]) if '_all_open_pairs' in st.session_state else 0
+            _risk = risk_position_size(_ml, _portfolio, _n_open)
+            
+            if not _risk['allowed']:
+                st.error(_risk['reason'])
+            
+            _suggested_size = int(_risk['size_usdt']) if _risk['allowed'] else 100
+        except Exception:
+            _ml = {'score': 0, 'grade': '?', 'recommendation': ''}
+            _suggested_size = 100
+        
         # === EXCHANGE INSTRUCTIONS ===
         _size_usdt = st.number_input("💰 Размер позиции (USDT)", 
-                                      min_value=10, max_value=10000, value=100, step=10,
+                                      min_value=10, max_value=10000, value=_suggested_size, step=10,
                                       key="one_click_size")
         
         if _dir == 'SHORT':
@@ -3329,13 +3486,19 @@ if st.session_state.pairs_data is not None:
         _c2_qty = _c2_size / _p2 if _p2 > 0 else 0
         
         # Clipboard-ready text
+        _fr_net = selected_data.get('funding_net', 0)
+        _fr_str = f"FR Net={_fr_net:+.3f}%/8h" if _fr_net != 0 else "FR=N/A"
+        _ml_grade = _ml.get('grade', '?') if '_ml' in dir() else '?'
+        _ml_pts = _ml.get('score', 0) if '_ml' in dir() else 0
         _exchange_text = (
             f"═══ {_c1}/{_c2} {_dir} ═══\n"
-            f"Leg 1: {_c1}/USDT → {_c1_action}\n"
+            f"ML: Grade {_ml_grade} ({_ml_pts:.0f}pt) | {_fr_str}\n"
+            f"\n"
+            f"Leg 1: {_c1}/USDT:USDT → {_c1_action}\n"
             f"  Размер: ~{_c1_size:.1f} USDT ({_c1_qty:.4f} {_c1})\n"
             f"  Цена: {_p1:.6g} USDT\n"
             f"\n"
-            f"Leg 2: {_c2}/USDT → {_c2_action}\n"
+            f"Leg 2: {_c2}/USDT:USDT → {_c2_action}\n"
             f"  Размер: ~{_c2_size:.1f} USDT ({_c2_qty:.4f} {_c2})\n"
             f"  Цена: {_p2:.6g} USDT\n"
             f"\n"
@@ -3377,10 +3540,14 @@ if st.session_state.pairs_data is not None:
             'hurst': _hurst,
             'halflife_hours': _hl,
             'mbt_quick': _mbt,
+            'ml_grade': _ml.get('grade', '?') if '_ml' in dir() else '?',
+            'ml_score': _ml.get('score', 0) if '_ml' in dir() else 0,
+            'risk_size_usdt': _size_usdt,
             'notes': f"Q={selected_data.get('quality_score',0)} "
                      f"H={_hurst:.3f} HL={_hl:.0f}h "
                      f"μBT={_mbt:.0f}% "
-                     f"Score={_passed}/{_total} "
+                     f"ML={_ml.get('grade','?')}{_ml.get('score',0):.0f} "
+                     f"Size={_size_usdt}$ "
                      f"{'NAKED!' if selected_data.get('hr_naked') else ''}",
         }
         json_str = json.dumps(monitor_data, indent=2, ensure_ascii=False)

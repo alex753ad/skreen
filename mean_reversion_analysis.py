@@ -2017,16 +2017,22 @@ def smart_exit_analysis(z_entry, z_now, z_history, pnl_pct, hours_in,
         best_pnl = max(pnl_pct, 0)
     
     # === 1. TRAILING Z-STOP ===
-    # v27: thresholds from config
+    # v28: FIX — only track Z since entry, not full 300-bar history!
+    # BUG WAS: min(z_hist) picks up Z=-28 from weeks before trade
     _z_bounce = CFG('monitor', 'trailing_z_bounce', 0.8)
     
-    # Track best Z (closest to 0)
+    # Estimate bars since entry to limit z_history
+    _hpb = {'1h': 1, '4h': 4, '1d': 24}.get('4h', 4)
+    _bars_since_entry = max(1, int(hours_in / _hpb) + 2)  # +2 safety margin
+    z_since_entry = z_hist[-_bars_since_entry:] if len(z_hist) > _bars_since_entry else z_hist
+    
+    # Track best Z (closest to 0) ONLY since entry
     if direction == 'SHORT':
-        best_z_for_us = min(z_hist) if len(z_hist) > 0 else z_now
+        best_z_for_us = min(z_since_entry) if len(z_since_entry) > 0 else z_now
         z_reverted_well = best_z_for_us < 0.5
         z_retreated = z_now > best_z_for_us + _z_bounce
     else:
-        best_z_for_us = max(z_hist) if len(z_hist) > 0 else z_now
+        best_z_for_us = max(z_since_entry) if len(z_since_entry) > 0 else z_now
         z_reverted_well = best_z_for_us > -0.5
         z_retreated = z_now < best_z_for_us - _z_bounce
     
@@ -2034,8 +2040,8 @@ def smart_exit_analysis(z_entry, z_now, z_history, pnl_pct, hours_in,
         signals.append({
             'type': 'TRAILING_Z',
             'urgency': 2,
-            'message': f'📉 Z достиг {best_z_for_us:+.2f}, но откатился к {z_now:+.2f}. '
-                       f'Фиксируйте прибыль — Z-trailing stop сработал.'
+            'message': f'📉 Best Z (since entry): {best_z_for_us:+.2f} → now {z_now:+.2f} '
+                       f'(bounce ≥{_z_bounce:.1f}). Z-trailing stop.'
         })
         urgency = max(urgency, 2)
     
