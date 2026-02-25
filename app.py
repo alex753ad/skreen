@@ -202,30 +202,39 @@ def send_telegram_test(token, chat_id):
     return send_telegram(token, chat_id, msg)
 
 def format_telegram_signal(pairs_list, timeframe, exchange):
-    """Format SIGNAL pairs for Telegram."""
+    """Format SIGNAL pairs for Telegram — v27: matches trade TXT format."""
     if not pairs_list:
         return None
     lines = [f"🔔 <b>Pairs Scanner Alert</b>"]
     lines.append(f"⏰ {now_msk().strftime('%H:%M МСК %d.%m.%Y')}")
-    lines.append(f"📊 {exchange.upper()} | {timeframe}\n")
+    lines.append(f"📊 {exchange.upper()} | {timeframe} | FUTURES\n")
     
     for p in pairs_list:
         d = p.get('direction', '?')
-        emoji = '🟢' if d == 'LONG' else '🔴'
-        cusum_risk = p.get('cusum_risk', 'LOW')
-        risk_tag = f' ⚠️{cusum_risk}' if cusum_risk not in ('LOW',) else ''
-        mtf = '✅MTF' if p.get('mtf_confirmed') else '❌MTF'
-        joh = '✅J' if p.get('johansen_coint') else ''
-        conflict = ' 🚨КОНФЛ' if p.get('coin_conflict') else ''
-        bt_tag = ''
-        if p.get('bt_trades', 0) > 0:
-            bt_tag = f" BT:{p.get('bt_verdict','?')}"
-        hr_val = p.get('hedge_ratio', 0)
+        c1, c2 = p.get('coin1', '?'), p.get('coin2', '?')
+        z = p.get('zscore', 0)
+        hr = p.get('hedge_ratio', 0)
+        hl = p.get('halflife_hours', 0)
+        hurst = p.get('hurst', 0)
+        mbt_q = p.get('mbt_quick', 0)
+        mbt_pnl = p.get('mbt_avg_pnl', 0)
+        entry = p.get('_entry_label', p.get('signal', ''))
+        mtf = '✅' if p.get('mtf_confirmed') else '❌'
+        
+        if d == 'SHORT':
+            c1_act, c2_act = 'SELL', 'BUY'
+        else:
+            c1_act, c2_act = 'BUY', 'SELL'
+        
+        emoji = '🟢' if '🟢' in entry else '🟡' if '🟡' in entry else '⚪'
+        
         lines.append(
-            f"{emoji} <b>{p['pair']}</b> {d} Z={p['zscore']:+.2f}\n"
-            f"   Q={p.get('quality_score',0)} H={p.get('hurst',0):.3f} "
-            f"HR={hr_val:.4f}\n"
-            f"   {mtf} {joh}{risk_tag}{bt_tag}{conflict}"
+            f"{'═'*20}\n"
+            f"{emoji} <b>{c1}/{c2} {d}</b> {entry}\n"
+            f"  {c1}/USDT → {c1_act} | {c2}/USDT → {c2_act}\n"
+            f"  Z={z:+.2f} | HR={hr:.4f} | HL={hl:.0f}ч\n"
+            f"  H={hurst:.3f} | μBT={mbt_q:.0f}% ({mbt_pnl:+.2f}%)\n"
+            f"  MTF:{mtf} | Q={p.get('quality_score',0)}"
         )
     return "\n".join(lines)
 
@@ -377,28 +386,25 @@ class CryptoPairsScanner:
         raise Exception(f"❌ Все биржи недоступны. Последняя ошибка: {last_error}")
         
     def get_top_coins(self, limit=100):
-        """Получить топ монет по объему торгов"""
+        """Получить топ монет по объему торгов (FUTURES/SWAP)"""
         try:
             markets = self.exchange.load_markets()
-            tickers = self.exchange.fetch_tickers()
+            tickers = self.exchange.fetch_tickers({'type': 'swap'})
             
-            # Определяем базовую валюту в зависимости от биржи
-            if self.exchange_name == 'bybit':
-                base_currency = 'USDT'
-                # Bybit использует формат BTC/USDT:USDT для futures, нам нужен только spot
-                usdt_pairs = {k: v for k, v in tickers.items() 
-                            if f'/{base_currency}' in k 
-                            and ':' not in k  # Исключаем futures
-                            and 'info' in v}
-            else:
-                # Для других бирж (Binance, OKX, etc)
-                base_currency = 'USDT'
-                usdt_pairs = {k: v for k, v in tickers.items() 
-                            if f'/{base_currency}' in k and ':USDT' not in k}
+            # v27: FUTURES — используем swap perpetual (/USDT:USDT)
+            base_currency = 'USDT'
+            swap_pairs = {}
+            for k, v in tickers.items():
+                # Swap format: BTC/USDT:USDT
+                if f'/{base_currency}:USDT' in k:
+                    swap_pairs[k] = v
+                # Spot fallback: BTC/USDT (no colon) — include if no swaps found
+                elif f'/{base_currency}' in k and ':' not in k and not swap_pairs:
+                    swap_pairs[k] = v
             
-            # Сортируем по объему (разные биржи используют разные поля)
+            # Сортируем по объему
             valid_pairs = []
-            for symbol, ticker in usdt_pairs.items():
+            for symbol, ticker in swap_pairs.items():
                 try:
                     volume = float(ticker.get('quoteVolume', 0)) or float(ticker.get('volume', 0))
                     if volume > 0:
@@ -409,11 +415,16 @@ class CryptoPairsScanner:
             # Сортируем по объему
             sorted_pairs = sorted(valid_pairs, key=lambda x: x[1], reverse=True)
             
-            # Берем топ монет
-            top_coins = [pair[0].replace(f'/{base_currency}', '') for pair in sorted_pairs[:limit]]
+            # Берем топ монет — strip swap suffix (:USDT)
+            top_coins = []
+            for pair in sorted_pairs[:limit]:
+                sym = pair[0]  # e.g. BTC/USDT:USDT
+                coin = sym.split('/')[0]  # BTC
+                if coin not in top_coins:
+                    top_coins.append(coin)
             
             if len(top_coins) > 0:
-                st.info(f"📊 Загружено {len(top_coins)} монет с {self.exchange_name.upper()}")
+                st.info(f"📊 Загружено {len(top_coins)} монет (futures) с {self.exchange_name.upper()}")
                 return top_coins
             else:
                 raise Exception("Не удалось получить данные о монетах")
@@ -428,29 +439,47 @@ class CryptoPairsScanner:
                    'NEAR', 'APT', 'ARB', 'OP', 'DOGE']
     
     def fetch_ohlcv(self, symbol, limit=None):
-        """Получить исторические данные с retry при ошибках сети."""
+        """Получить исторические данные с retry. v27: futures first, spot fallback."""
         if limit is None:
             bars_per_day = {'1h': 24, '4h': 6, '1d': 1, '2h': 12, '15m': 96}.get(self.timeframe, 6)
             limit = self.lookback_days * bars_per_day
         
-        # v27: Retry with exponential backoff
+        # v27: Try swap (futures) first, then spot
+        symbols_to_try = []
+        if ':' not in symbol:
+            symbols_to_try.append(symbol + ':USDT')  # BTC/USDT → BTC/USDT:USDT
+        symbols_to_try.append(symbol)  # fallback to original
+        
         last_err = None
-        for attempt in range(3):
-            try:
-                ohlcv = self.exchange.fetch_ohlcv(symbol, self.timeframe, limit=limit)
-                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                df.set_index('timestamp', inplace=True)
-                return df['close']
-            except (ccxt.NetworkError, ccxt.RequestTimeout, ccxt.ExchangeNotAvailable) as e:
-                last_err = e
-                _wait = [2, 5, 15][attempt]
-                import time as _time
-                _time.sleep(_wait)
-            except Exception as e:
-                return None
-        # All retries failed
+        for sym in symbols_to_try:
+            for attempt in range(3):
+                try:
+                    ohlcv = self.exchange.fetch_ohlcv(sym, self.timeframe, limit=limit)
+                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    df.set_index('timestamp', inplace=True)
+                    return df['close']
+                except (ccxt.NetworkError, ccxt.RequestTimeout, ccxt.ExchangeNotAvailable) as e:
+                    last_err = e
+                    import time as _time
+                    _time.sleep([2, 5, 15][attempt])
+                except Exception as e:
+                    last_err = e
+                    break  # try next symbol
         return None
+    
+    def fetch_funding_rate(self, coin):
+        """v27: Fetch current funding rate for perpetual swap."""
+        try:
+            symbol = f"{coin}/USDT:USDT"
+            fr = self.exchange.fetch_funding_rate(symbol)
+            return {
+                'rate': float(fr.get('fundingRate', 0) or 0),
+                'next_time': fr.get('fundingDatetime', ''),
+                'rate_pct': float(fr.get('fundingRate', 0) or 0) * 100,
+            }
+        except Exception:
+            return {'rate': 0, 'next_time': '', 'rate_pct': 0}
     
     def test_cointegration(self, series1, series2):
         """
@@ -567,17 +596,20 @@ class CryptoPairsScanner:
             hpb = {'1h': 24, '4h': 6, '1d': 1}.get(confirm_tf, 6)
             limit = 7 * hpb  # 7 дней на младшем ТФ (168 баров для 1h)
             
-            # v27: Retry wrapper for MTF data
+            # v27: Retry wrapper for MTF data + futures
             ohlcv1, ohlcv2 = None, None
-            for _attempt in range(3):
-                try:
-                    ohlcv1 = self.exchange.fetch_ohlcv(f"{coin1}/USDT", confirm_tf, limit=limit)
-                    ohlcv2 = self.exchange.fetch_ohlcv(f"{coin2}/USDT", confirm_tf, limit=limit)
-                    break
-                except (ccxt.NetworkError, ccxt.RequestTimeout, ccxt.ExchangeNotAvailable):
-                    import time as _time
-                    _time.sleep([2, 5, 15][_attempt])
-                except Exception:
+            for _sym_sfx in [':USDT', '']:
+                for _attempt in range(3):
+                    try:
+                        ohlcv1 = self.exchange.fetch_ohlcv(f"{coin1}/USDT{_sym_sfx}", confirm_tf, limit=limit)
+                        ohlcv2 = self.exchange.fetch_ohlcv(f"{coin2}/USDT{_sym_sfx}", confirm_tf, limit=limit)
+                        break
+                    except (ccxt.NetworkError, ccxt.RequestTimeout, ccxt.ExchangeNotAvailable):
+                        import time as _time
+                        _time.sleep([2, 5, 15][_attempt])
+                    except Exception:
+                        break
+                if ohlcv1 and ohlcv2:
                     break
             
             if not ohlcv1 or not ohlcv2:
@@ -1228,6 +1260,10 @@ class CryptoPairsScanner:
                 # v11.2: Warnings
                 'hr_warning': hr_warning,
                 'bars_warning': bars_warning,
+                # v27: Funding rate (populated later for SIGNAL pairs)
+                'funding_rate_1': 0.0,
+                'funding_rate_2': 0.0,
+                'funding_net': 0.0,
             })
         
         # Сортируем: v6.0 — сначала по entry readiness, потом по Signal, потом по Quality
@@ -1318,6 +1354,28 @@ class CryptoPairsScanner:
                         r['pca_net_pc1'] = fe.get('net_exposure', {}).get('PC1', 0)
                 except Exception:
                     pass
+        
+        # v27: Fetch funding rates for SIGNAL/READY pairs (futures)
+        try:
+            _funding_cache = {}
+            for r in results:
+                if r.get('signal') in ('SIGNAL', 'READY'):
+                    for coin_key in ('coin1', 'coin2'):
+                        c = r[coin_key]
+                        if c not in _funding_cache:
+                            _funding_cache[c] = self.fetch_funding_rate(c)
+                    fr1 = _funding_cache.get(r['coin1'], {})
+                    fr2 = _funding_cache.get(r['coin2'], {})
+                    r['funding_rate_1'] = fr1.get('rate_pct', 0)
+                    r['funding_rate_2'] = fr2.get('rate_pct', 0)
+                    # Net funding: what we pay/receive per 8h
+                    d = r.get('direction', 'LONG')
+                    if d == 'SHORT':
+                        r['funding_net'] = -r['funding_rate_1'] + r['funding_rate_2']
+                    else:
+                        r['funding_net'] = r['funding_rate_1'] - r['funding_rate_2']
+        except Exception:
+            pass
         
         return results[:max_pairs]
     
@@ -2335,6 +2393,25 @@ if st.session_state.pairs_data is not None:
     conf = selected_data.get('confidence', '?')
     threshold = selected_data.get('threshold', 2.0)
     dir_emoji = {'LONG': '🟢↑', 'SHORT': '🔴↓', 'NONE': ''}.get(direction, '')
+    
+    # v27: Pair Memory display
+    try:
+        from config_loader import pair_memory_summary
+        _pm = pair_memory_summary(selected_pair)
+        if _pm:
+            st.info(_pm)
+    except Exception:
+        pass
+    
+    # v27: Funding rate display
+    _fr1 = selected_data.get('funding_rate_1', 0)
+    _fr2 = selected_data.get('funding_rate_2', 0)
+    _frn = selected_data.get('funding_net', 0)
+    if _fr1 != 0 or _fr2 != 0:
+        _fr_color = "🟢" if _frn > 0 else "🔴" if _frn < -0.01 else "⚪"
+        st.caption(f"💰 Funding: {selected_data.get('coin1','')}={_fr1:+.4f}% | "
+                  f"{selected_data.get('coin2','')}={_fr2:+.4f}% | "
+                  f"Net={_fr_color} {_frn:+.4f}%/8h")
     
     km1, km2, km3, km4, km5 = st.columns(5)
     km1.metric("Z-Score", f"{selected_data['zscore']:+.2f}", f"Порог: ±{threshold}")
