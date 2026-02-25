@@ -413,26 +413,38 @@ def _get_exchange(exchange_name):
 
 @st.cache_data(ttl=120)
 def fetch_prices(exchange_name, coin, timeframe, lookback_bars=300):
-    try:
-        ex, actual = _get_exchange(exchange_name)
-        if ex is None: return None
-        symbol = f"{coin}/USDT"
-        ohlcv = ex.fetch_ohlcv(symbol, timeframe, limit=lookback_bars)
-        df = pd.DataFrame(ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-        return df
-    except:
-        return None
+    """v27: Fetch with retry on network errors."""
+    import ccxt as _ccxt
+    for _attempt in range(3):
+        try:
+            ex, actual = _get_exchange(exchange_name)
+            if ex is None: return None
+            symbol = f"{coin}/USDT"
+            ohlcv = ex.fetch_ohlcv(symbol, timeframe, limit=lookback_bars)
+            df = pd.DataFrame(ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
+            df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+            return df
+        except (_ccxt.NetworkError, _ccxt.RequestTimeout, _ccxt.ExchangeNotAvailable):
+            time.sleep([2, 5, 15][_attempt])
+        except:
+            return None
+    return None
 
 
 def get_current_price(exchange_name, coin):
-    try:
-        ex, actual = _get_exchange(exchange_name)
-        if ex is None: return None
-        ticker = ex.fetch_ticker(f"{coin}/USDT")
-        return ticker['last']
-    except:
-        return None
+    """v27: Get price with retry."""
+    import ccxt as _ccxt
+    for _attempt in range(3):
+        try:
+            ex, actual = _get_exchange(exchange_name)
+            if ex is None: return None
+            ticker = ex.fetch_ticker(f"{coin}/USDT")
+            return ticker['last']
+        except (_ccxt.NetworkError, _ccxt.RequestTimeout, _ccxt.ExchangeNotAvailable):
+            time.sleep([2, 5, 15][_attempt])
+        except:
+            return None
+    return None
 
 
 # ═══════════════════════════════════════════════════════
@@ -1840,4 +1852,3 @@ st.caption("""
 3. Введи в форму слева → "Загрузить цены + Добавить"
 4. Монитор покажет когда закрывать + предупредит если пара потеряла качество
 """)
-
