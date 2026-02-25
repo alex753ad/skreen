@@ -63,3 +63,10 @@ z_velocity:
   lookback: 5
   excellent_min_vel: 0.1
   decel_threshold: 0.05
+
+risk:
+  max_positions: 5
+  max_per_trade_pct: 20
+  min_per_trade_pct: 5
+  max_total_exposure_pct: 80
+  portfolio_usdt: 1000
