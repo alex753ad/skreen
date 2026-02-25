@@ -428,20 +428,29 @@ class CryptoPairsScanner:
                    'NEAR', 'APT', 'ARB', 'OP', 'DOGE']
     
     def fetch_ohlcv(self, symbol, limit=None):
-        """Получить исторические данные"""
-        try:
-            if limit is None:
-                # Конвертируем дни в количество баров
-                bars_per_day = {'1h': 24, '4h': 6, '1d': 1, '2h': 12, '15m': 96}.get(self.timeframe, 6)
-                limit = self.lookback_days * bars_per_day
-            
-            ohlcv = self.exchange.fetch_ohlcv(symbol, self.timeframe, limit=limit)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            return df['close']
-        except Exception as e:
-            return None
+        """Получить исторические данные с retry при ошибках сети."""
+        if limit is None:
+            bars_per_day = {'1h': 24, '4h': 6, '1d': 1, '2h': 12, '15m': 96}.get(self.timeframe, 6)
+            limit = self.lookback_days * bars_per_day
+        
+        # v27: Retry with exponential backoff
+        last_err = None
+        for attempt in range(3):
+            try:
+                ohlcv = self.exchange.fetch_ohlcv(symbol, self.timeframe, limit=limit)
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df.set_index('timestamp', inplace=True)
+                return df['close']
+            except (ccxt.NetworkError, ccxt.RequestTimeout, ccxt.ExchangeNotAvailable) as e:
+                last_err = e
+                _wait = [2, 5, 15][attempt]
+                import time as _time
+                _time.sleep(_wait)
+            except Exception as e:
+                return None
+        # All retries failed
+        return None
     
     def test_cointegration(self, series1, series2):
         """
@@ -558,8 +567,21 @@ class CryptoPairsScanner:
             hpb = {'1h': 24, '4h': 6, '1d': 1}.get(confirm_tf, 6)
             limit = 7 * hpb  # 7 дней на младшем ТФ (168 баров для 1h)
             
-            ohlcv1 = self.exchange.fetch_ohlcv(f"{coin1}/USDT", confirm_tf, limit=limit)
-            ohlcv2 = self.exchange.fetch_ohlcv(f"{coin2}/USDT", confirm_tf, limit=limit)
+            # v27: Retry wrapper for MTF data
+            ohlcv1, ohlcv2 = None, None
+            for _attempt in range(3):
+                try:
+                    ohlcv1 = self.exchange.fetch_ohlcv(f"{coin1}/USDT", confirm_tf, limit=limit)
+                    ohlcv2 = self.exchange.fetch_ohlcv(f"{coin2}/USDT", confirm_tf, limit=limit)
+                    break
+                except (ccxt.NetworkError, ccxt.RequestTimeout, ccxt.ExchangeNotAvailable):
+                    import time as _time
+                    _time.sleep([2, 5, 15][_attempt])
+                except Exception:
+                    break
+            
+            if not ohlcv1 or not ohlcv2:
+                return {'mtf_confirmed': None, 'mtf_reason': f'Не удалось получить данные {confirm_tf}'}
             
             if len(ohlcv1) < 50 or len(ohlcv2) < 50:
                 return {'mtf_confirmed': None, 'mtf_reason': f'Мало данных {confirm_tf}'}
@@ -3178,12 +3200,11 @@ if st.session_state.pairs_data is not None:
         key="detail_csv_btn"
     )
     
-    # v22: R3 — Auto-Import to Monitor
+    # v27: One-Click Entry (2.3) + R3 Auto-Import
     if selected_data.get('signal') in ('SIGNAL', 'READY'):
         st.markdown("---")
-        st.markdown("#### 📤 Экспорт в Монитор позиций (R3)")
+        st.markdown("#### 🚀 One-Click Entry (R3 + 2.3)")
         
-        # Get current prices from scanner data
         _c1 = selected_data.get('coin1', '')
         _c2 = selected_data.get('coin2', '')
         _dir = selected_data.get('direction', 'LONG')
@@ -3192,10 +3213,79 @@ if st.session_state.pairs_data is not None:
         _p1 = selected_data.get('price1_last', 0)
         _p2 = selected_data.get('price2_last', 0)
         _tf = timeframe if 'timeframe' in dir() else '4h'
+        _mbt = selected_data.get('mbt_quick', 0)
+        _hurst = selected_data.get('hurst', 0.5)
+        _hl = selected_data.get('halflife_hours', 24)
+        _vel = selected_data.get('z_entry_quality', '')
         
-        # Warnings
+        # Warnings panel
+        _warnings = []
         if selected_data.get('hr_naked'):
-            st.error(f"⚠️ **NAKED POSITION**: HR={_hr:.4f} < 0.15. Фактически направленная ставка на {_c1}!")
+            _warnings.append(f"🔴 NAKED: HR={_hr:.4f} < {CFG('strategy', 'hr_naked_threshold', 0.15)}")
+        if _hurst >= CFG('strategy', 'min_hurst', 0.45):
+            _warnings.append(f"🟡 Hurst={_hurst:.3f} ≥ {CFG('strategy', 'min_hurst', 0.45)}")
+        if selected_data.get('hr_uncertainty', 0) > 0.3:
+            _warnings.append(f"🟡 HR uncertainty={selected_data.get('hr_uncertainty',0):.1%}")
+        if not selected_data.get('mtf_confirmed'):
+            _warnings.append("🟡 MTF не подтверждён")
+        
+        if _warnings:
+            st.warning(" | ".join(_warnings))
+        
+        # === EXCHANGE INSTRUCTIONS ===
+        _size_usdt = st.number_input("💰 Размер позиции (USDT)", 
+                                      min_value=10, max_value=10000, value=100, step=10,
+                                      key="one_click_size")
+        
+        if _dir == 'SHORT':
+            _c1_action = f"SELL (SHORT)"
+            _c2_action = f"BUY (LONG)"
+            _c1_size = _size_usdt / (1 + abs(_hr))
+            _c2_size = _size_usdt * abs(_hr) / (1 + abs(_hr))
+        else:
+            _c1_action = f"BUY (LONG)"
+            _c2_action = f"SELL (SHORT)"
+            _c1_size = _size_usdt / (1 + abs(_hr))
+            _c2_size = _size_usdt * abs(_hr) / (1 + abs(_hr))
+        
+        _c1_qty = _c1_size / _p1 if _p1 > 0 else 0
+        _c2_qty = _c2_size / _p2 if _p2 > 0 else 0
+        
+        # Clipboard-ready text
+        _exchange_text = (
+            f"═══ {_c1}/{_c2} {_dir} ═══\n"
+            f"Leg 1: {_c1}/USDT → {_c1_action}\n"
+            f"  Размер: ~{_c1_size:.1f} USDT ({_c1_qty:.4f} {_c1})\n"
+            f"  Цена: {_p1:.6g} USDT\n"
+            f"\n"
+            f"Leg 2: {_c2}/USDT → {_c2_action}\n"
+            f"  Размер: ~{_c2_size:.1f} USDT ({_c2_qty:.4f} {_c2})\n"
+            f"  Цена: {_p2:.6g} USDT\n"
+            f"\n"
+            f"HR = {_hr:.6f} | Z = {_z:+.2f} | HL = {_hl:.0f}ч\n"
+            f"μBT Quick = {_mbt:.0f}% | Hurst = {_hurst:.3f}\n"
+            f"Total: {_size_usdt} USDT"
+        )
+        
+        st.code(_exchange_text, language=None)
+        
+        # === ENTRY QUALITY SUMMARY ===
+        _checks = []
+        _checks.append(("Z > entry_z", abs(_z) >= CFG('strategy', 'entry_z', 1.8), f"|Z|={abs(_z):.2f}"))
+        _checks.append(("μBT Quick ≥ 50%", _mbt >= 50, f"{_mbt:.0f}%"))
+        _checks.append(("Hurst < 0.45", _hurst < CFG('strategy', 'min_hurst', 0.45), f"{_hurst:.3f}"))
+        _checks.append(("MTF OK", bool(selected_data.get('mtf_confirmed')), str(selected_data.get('mtf_strength', '?'))))
+        _checks.append(("HR > naked", not selected_data.get('hr_naked'), f"HR={_hr:.4f}"))
+        _checks.append(("V↕ OK", _vel in ('EXCELLENT', 'GOOD', ''), str(_vel or 'N/A')))
+        
+        _passed = sum(1 for _, ok, _ in _checks if ok)
+        _total = len(_checks)
+        _color = "🟢" if _passed >= 5 else "🟡" if _passed >= 3 else "🔴"
+        st.markdown(f"**{_color} Entry Score: {_passed}/{_total}** — " + 
+                   ", ".join(f"{'✅' if ok else '❌'} {name}" for name, ok, _ in _checks))
+        
+        # === BUTTONS ===
+        b1, b2, b3 = st.columns(3)
         
         import json
         monitor_data = {
@@ -3207,36 +3297,46 @@ if st.session_state.pairs_data is not None:
             'entry_price2': round(_p2, 6) if _p2 else 0,
             'timeframe': _tf,
             'quality_score': selected_data.get('quality_score', 0),
-            'hurst': selected_data.get('hurst', 0.5),
-            'halflife_hours': selected_data.get('halflife_hours', 24),
+            'hurst': _hurst,
+            'halflife_hours': _hl,
+            'mbt_quick': _mbt,
             'notes': f"Q={selected_data.get('quality_score',0)} "
-                     f"H={selected_data.get('hurst',0):.3f} "
-                     f"HL={selected_data.get('halflife_hours',0):.0f}h "
+                     f"H={_hurst:.3f} HL={_hl:.0f}h "
+                     f"μBT={_mbt:.0f}% "
+                     f"Score={_passed}/{_total} "
                      f"{'NAKED!' if selected_data.get('hr_naked') else ''}",
         }
-        
         json_str = json.dumps(monitor_data, indent=2, ensure_ascii=False)
         
-        mi1, mi2 = st.columns(2)
-        with mi1:
-            st.download_button(
-                f"📤 Экспорт {_c1}/{_c2} → Монитор (JSON)",
-                json_str,
-                f"monitor_import_{_c1}_{_c2}_{now_msk().strftime('%H%M%S')}.json",
-                "application/json",
-                key="monitor_export_btn"
-            )
-        with mi2:
-            # Also save to shared file for monitor to pick up
+        with b1:
+            # Save pending file for monitor to auto-import
             try:
                 import os
                 os.makedirs("monitor_import", exist_ok=True)
                 imp_path = f"monitor_import/pending_{_c1}_{_c2}.json"
                 with open(imp_path, 'w') as f:
                     json.dump(monitor_data, f, ensure_ascii=False)
-                st.success(f"✅ Сохранено для импорта: `{imp_path}`")
+                st.success(f"✅ Готово к импорту в Монитор")
             except Exception as ex:
                 st.warning(f"⚠️ {ex}")
+        
+        with b2:
+            st.download_button(
+                f"📥 JSON → Монитор",
+                json_str,
+                f"monitor_import_{_c1}_{_c2}.json",
+                "application/json",
+                key="monitor_export_btn"
+            )
+        
+        with b3:
+            st.download_button(
+                f"📋 Инструкции (TXT)",
+                _exchange_text,
+                f"trade_{_c1}_{_c2}_{now_msk().strftime('%H%M')}.txt",
+                "text/plain",
+                key="exchange_txt_btn"
+            )
     
     # Экспорт данных — расширенный CSV (v7.1)
     st.markdown("---")
