@@ -21,7 +21,7 @@ try:
     from config_loader import CFG
 except ImportError:
     def CFG(section, key=None, default=None):
-        _d = {'strategy': {'entry_z': 1.8, 'exit_z': 0.8, 'commission_pct': 0.10,
+        _d = {'strategy': {'entry_z': 1.8, 'exit_z': 0.5, 'commission_pct': 0.10,
               'slippage_pct': 0.05, 'take_profit_pct': 1.5},
               'backtester': {'max_bars': 50, 'min_bars': 2}}
         if key is None:
