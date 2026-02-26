@@ -9,12 +9,12 @@
 # --- СТРАТЕГИЯ ---
 strategy:
   entry_z: 1.8
-  exit_z: 0.8
+  exit_z: 0.5
   stop_z_offset: 2.0
   min_stop_z: 4.0
   take_profit_pct: 1.5
   stop_loss_pct: -5.0
-  max_hold_hours: 72
+  max_hold_hours: 3
   micro_bt_max_bars: 6
   min_hurst: 0.45
   warn_hurst: 0.48
@@ -36,7 +36,7 @@ scanner:
 monitor:
   refresh_interval_sec: 120
   exit_z_target: 0.5
-  pnl_stop_pct: -5.0
+  pnl_stop_pct: -1.2
   trailing_z_bounce: 0.8
   time_warning_ratio: 1.0
   time_exit_ratio: 1.5
@@ -49,6 +49,25 @@ monitor:
   hurst_border: 0.45
   pvalue_warning: 0.10
   correlation_warning: 0.20
+  # --- AUTO-EXIT ---
+  auto_exit_enabled: true
+  auto_tp_pct: 0.8
+  auto_sl_pct: -1.2
+  auto_exit_z: 0.3
+  auto_exit_z_min_pnl: 0.3
+  trailing_enabled: true
+  trailing_activate_pct: 0.5
+  trailing_drawdown_pct: 0.25
+  # --- CONFLICT & COOLDOWN ---
+  auto_flip_enabled: true
+  pair_cooldown_hours: 4
+  pair_loss_limit_pct: -2.0
+  coin_loss_warn_pct: -3.0
+  daily_loss_limit_pct: -5.0
+  # --- LIMITS ---
+  max_positions: 10
+  max_coin_exposure: 4
+  entry_grace_minutes: 15
 
 # --- БЭКТЕСТЕР ---
 backtester:
@@ -64,9 +83,9 @@ z_velocity:
   excellent_min_vel: 0.1
   decel_threshold: 0.05
 
-risk:
-  max_positions: 5
-  max_per_trade_pct: 20
-  min_per_trade_pct: 5
-  max_total_exposure_pct: 80
-  portfolio_usdt: 1000
+# --- RALLY FILTER ---
+rally_filter:
+  warning_z: 2.0
+  block_z: 2.5
+  exit_z: 0.0
+  cooldown_bars: 2
