@@ -165,6 +165,7 @@ def save_rally_state(state):
 def check_rally_filter(exchange_obj, timeframe='4h'):
     """Check if BTC is in rally mode (Z > 1.0) — blocks new LONG signals.
     Thresholds: enter_rally=1.0, deep_rally=1.2, exit_rally=-0.5
+    Cooldown: after exiting rally, wait 2 bars before allowing LONG signals again.
     """
     state = load_rally_state()
     try:
@@ -180,23 +181,48 @@ def check_rally_filter(exchange_obj, timeframe='4h'):
         else:
             btc_z = float((closes[-1] - med) / mad)
         
-        was_rally = state.get('status', 'NORMAL') != 'NORMAL'
+        was_rally = state.get('status', 'NORMAL') not in ('NORMAL', 'COOLDOWN')
+        prev_status = state.get('status', 'NORMAL')
         
         if was_rally:
             # Exit rally only when Z drops below -0.5
             if btc_z < -0.5:
-                state['status'] = 'NORMAL'
+                state['status'] = 'COOLDOWN'
+                state['cooldown_start'] = now_msk().isoformat()
+                state['cooldown_bars'] = 0
+                state['status_changed'] = True  # for TG alert
             elif btc_z >= 1.2:
                 state['status'] = 'DEEP_RALLY'
+                state['status_changed'] = prev_status != 'DEEP_RALLY'
             else:
-                state['status'] = 'RALLY'  # still in rally
+                state['status'] = 'RALLY'
+                state['status_changed'] = False
+        elif prev_status == 'COOLDOWN':
+            # Count bars in cooldown (need 2 bars before allowing LONG)
+            bars_in_cd = state.get('cooldown_bars', 0) + 1
+            state['cooldown_bars'] = bars_in_cd
+            if bars_in_cd >= 2:
+                state['status'] = 'NORMAL'
+                state['status_changed'] = True
+            else:
+                state['status'] = 'COOLDOWN'
+                state['status_changed'] = False
+            # But if rally returns during cooldown
+            if btc_z >= 1.0:
+                state['status'] = 'RALLY' if btc_z < 1.2 else 'DEEP_RALLY'
+                state['cooldown_bars'] = 0
+                state['status_changed'] = True
         else:
+            # NORMAL
             if btc_z >= 1.2:
                 state['status'] = 'DEEP_RALLY'
+                state['status_changed'] = True
             elif btc_z >= 1.0:
                 state['status'] = 'RALLY'
+                state['status_changed'] = True
             else:
                 state['status'] = 'NORMAL'
+                state['status_changed'] = False
         
         state['btc_z'] = round(btc_z, 3)
         state['last_check'] = now_msk().isoformat()
@@ -204,6 +230,37 @@ def check_rally_filter(exchange_obj, timeframe='4h'):
         return state
     except Exception:
         return state
+
+
+def send_rally_alert(state, tg_token, tg_chat):
+    """Send Telegram alert when rally status changes."""
+    if not state.get('status_changed') or not tg_token or not tg_chat:
+        return
+    status = state.get('status', 'NORMAL')
+    btc_z = state.get('btc_z', 0)
+    if status == 'DEEP_RALLY':
+        msg = (f"🚨 <b>DEEP RALLY FILTER</b>\n"
+               f"BTC Z={btc_z:+.2f} ≥ 1.2\n"
+               f"⛔ Все LONG-сигналы ЗАБЛОКИРОВАНЫ\n"
+               f"Только SHORT разрешены")
+    elif status == 'RALLY':
+        msg = (f"⚠️ <b>RALLY FILTER АКТИВИРОВАН</b>\n"
+               f"BTC Z={btc_z:+.2f} ≥ 1.0\n"
+               f"LONG-сигналы под вопросом")
+    elif status == 'COOLDOWN':
+        msg = (f"⏳ <b>RALLY COOLDOWN</b>\n"
+               f"BTC Z={btc_z:+.2f} вернулся < -0.5\n"
+               f"Ожидание 2 бара перед разблокировкой LONG")
+    elif status == 'NORMAL':
+        msg = (f"✅ <b>RALLY FILTER СНЯТ</b>\n"
+               f"BTC Z={btc_z:+.2f}\n"
+               f"LONG-сигналы разрешены")
+    else:
+        return
+    try:
+        send_telegram(tg_token, tg_chat, msg)
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════════
@@ -2315,14 +2372,23 @@ if st.session_state.pairs_data is not None:
     try:
         _tmp_ex = ccxt.okx() if exchange == 'okx' else ccxt.binance()
         rally_state = check_rally_filter(_tmp_ex, timeframe)
+        # v31: Send Telegram alert on status change
+        if rally_state.get('status_changed') and st.session_state.get('tg_enabled'):
+            _tg_tok = st.session_state.get('tg_token', '')
+            _tg_cid = st.session_state.get('tg_chat_id', '')
+            send_rally_alert(rally_state, _tg_tok, _tg_cid)
     except Exception:
         pass
     
-    if rally_state.get('status') in ('RALLY', 'DEEP_RALLY'):
+    if rally_state.get('status') in ('RALLY', 'DEEP_RALLY', 'COOLDOWN'):
         _rl_z = rally_state.get('btc_z', 0)
         if rally_state['status'] == 'DEEP_RALLY':
             st.error(f"🚨 **DEEP RALLY FILTER** | BTC Z={_rl_z:+.2f} ≥ 1.2 | "
                      f"Все новые LONG-сигналы **ЗАБЛОКИРОВАНЫ**. Только SHORT разрешены.")
+        elif rally_state['status'] == 'COOLDOWN':
+            _cd_bars = rally_state.get('cooldown_bars', 0)
+            st.warning(f"⏳ **RALLY COOLDOWN** | BTC Z={_rl_z:+.2f} | "
+                       f"Ожидание {2 - _cd_bars} бар(ов) перед разблокировкой LONG.")
         else:
             st.warning(f"⚠️ **RALLY FILTER** | BTC Z={_rl_z:+.2f} ≥ 1.0 | "
                        f"LONG-сигналы под вопросом. Будьте осторожны.")
@@ -2424,10 +2490,12 @@ if st.session_state.pairs_data is not None:
                 )
                 
                 # v31.0: Rally filter warning for LONG signals
-                if rally_state.get('status') in ('RALLY', 'DEEP_RALLY') and d == 'LONG':
+                if rally_state.get('status') in ('RALLY', 'DEEP_RALLY', 'COOLDOWN') and d == 'LONG':
                     _rl_z = rally_state.get('btc_z', 0)
                     if rally_state['status'] == 'DEEP_RALLY':
                         st.error(f"🚨 RALLY FILTER: BTC Z={_rl_z:+.2f}. LONG-сигнал ЗАБЛОКИРОВАН!")
+                    elif rally_state['status'] == 'COOLDOWN':
+                        st.warning(f"⏳ RALLY COOLDOWN: BTC Z={_rl_z:+.2f}. LONG ещё заблокирован (ожидание).")
                     else:
                         st.warning(f"⚠️ RALLY FILTER: BTC Z={_rl_z:+.2f}. LONG-сигнал под вопросом.")
                 
@@ -2563,6 +2631,14 @@ if st.session_state.pairs_data is not None:
                            if p.get('funding_net', 0) != 0 else '—'),
                     # v28: ML Score
                     'ML': _ml_grade_for_table,
+                    # v31: Rally filter status for this pair
+                    'Rally': ('🚨' if rally_state.get('status') == 'DEEP_RALLY' and p.get('direction') == 'LONG'
+                              else '⚠️' if rally_state.get('status') in ('RALLY', 'COOLDOWN') and p.get('direction') == 'LONG'
+                              else ''),
+                    # v31: Position sizing
+                    '$': recommend_position_size(
+                        p.get('quality_score', 50), p.get('confidence', 'MEDIUM'),
+                        p.get('_entry_level', 'CONDITIONAL'), p.get('hurst', 0.5), p.get('correlation', 0.5)),
                 })
             except Exception as e:
                 # Log error instead of silently dropping row
@@ -2572,7 +2648,7 @@ if st.session_state.pairs_data is not None:
                     'Q': 0, 'S': 0, 'Conf': '', 'Z': 0, 'Thr': 0,
                     'FDR': '', 'Hurst': 0, 'H↕': '', 'Stab': '', 'HL': '',
                     'HR': 0, 'ρ': 0, 'Opt': '', 'Regime': '',
-                    'CUSUM': '', 'Joh': '', 'BT': '', 'μBT': '', 'V↕': '', 'WF': '', 'Конфл': '', 'PCA': '', 'FR': '', 'ML': '',
+                    'CUSUM': '', 'Joh': '', 'BT': '', 'μBT': '', 'V↕': '', 'WF': '', 'Конфл': '', 'PCA': '', 'FR': '', 'ML': '', 'Rally': '', '$': 0,
                 })
         df_display = pd.DataFrame(df_rows) if df_rows else pd.DataFrame()
     else:
