@@ -1587,7 +1587,7 @@ def plot_spread_chart(spread_data, pair_name, zscore, threshold=2.0, direction='
 # === ИНТЕРФЕЙС ===
 
 st.markdown('<p class="main-header">🔍 Crypto Pairs Trading Scanner</p>', unsafe_allow_html=True)
-st.caption("Версия 27.0 | 24.02.2026 | Unified Config + Auto-refresh FIX + R4/R5/R2/R1/R3")
+st.caption("Версия 31.0 | 26.02.2026 | Rally Filter + Position Sizing + Intercept display")
 
 # v27: Config info panel
 try:
