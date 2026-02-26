@@ -23,12 +23,14 @@ try:
 except ImportError:
     def CFG(section, key=None, default=None):
         """Fallback: return defaults if config_loader not available."""
-        _d = {'strategy': {'entry_z': 1.8, 'exit_z': 0.8, 'stop_z_offset': 2.0,
+        _d = {'strategy': {'entry_z': 1.8, 'exit_z': 0.5, 'stop_z_offset': 2.0,
               'min_stop_z': 4.0, 'take_profit_pct': 1.5, 'stop_loss_pct': -5.0,
-              'max_hold_hours': 72, 'micro_bt_max_bars': 6, 'min_hurst': 0.45,
+              'max_hold_hours': 3, 'micro_bt_max_bars': 6, 'min_hurst': 0.45,
               'hr_naked_threshold': 0.15, 'commission_pct': 0.10, 'slippage_pct': 0.05},
               'scanner': {'coins_limit': 100, 'timeframe': '4h', 'lookback_days': 50,
-              'exchange': 'okx', 'refresh_interval_min': 10}}
+              'exchange': 'okx', 'refresh_interval_min': 10},
+              'rally_filter': {'warning_z': 2.0, 'block_z': 2.5, 'exit_z': 0.0, 'cooldown_bars': 2},
+              'monitor': {'exit_z_target': 0.5, 'max_positions': 10}}
         if key is None:
             return _d.get(section, {})
         return _d.get(section, {}).get(key, default)
@@ -163,11 +165,15 @@ def save_rally_state(state):
     with open(RALLY_STATE_FILE, 'w') as f: json.dump(state, f, indent=2, default=str)
 
 def check_rally_filter(exchange_obj, timeframe='4h'):
-    """Check if BTC is in rally mode (Z > 1.0) — blocks new LONG signals.
-    Thresholds: enter_rally=1.0, deep_rally=1.2, exit_rally=-0.5
-    Cooldown: after exiting rally, wait 2 bars before allowing LONG signals again.
+    """Check if BTC is in rally mode — blocks new LONG signals.
+    v32: Thresholds from config (warning=2.0, block=2.5, exit=0.0)
     """
     state = load_rally_state()
+    # v32: Configurable thresholds
+    _warn_z = CFG('rally_filter', 'warning_z', 2.0)
+    _block_z = CFG('rally_filter', 'block_z', 2.5)
+    _exit_z = CFG('rally_filter', 'exit_z', 0.0)
+    _cd_bars = CFG('rally_filter', 'cooldown_bars', 2)
     try:
         ohlcv = exchange_obj.fetch_ohlcv('BTC/USDT', timeframe, limit=200)
         closes = np.array([c[4] for c in ohlcv])
@@ -185,39 +191,37 @@ def check_rally_filter(exchange_obj, timeframe='4h'):
         prev_status = state.get('status', 'NORMAL')
         
         if was_rally:
-            # Exit rally only when Z drops below -0.5
-            if btc_z < -0.5:
+            # Exit rally only when Z drops below exit threshold
+            if btc_z < _exit_z:
                 state['status'] = 'COOLDOWN'
                 state['cooldown_start'] = now_msk().isoformat()
                 state['cooldown_bars'] = 0
-                state['status_changed'] = True  # for TG alert
-            elif btc_z >= 1.2:
+                state['status_changed'] = True
+            elif btc_z >= _block_z:
                 state['status'] = 'DEEP_RALLY'
                 state['status_changed'] = prev_status != 'DEEP_RALLY'
             else:
                 state['status'] = 'RALLY'
                 state['status_changed'] = False
         elif prev_status == 'COOLDOWN':
-            # Count bars in cooldown (need 2 bars before allowing LONG)
             bars_in_cd = state.get('cooldown_bars', 0) + 1
             state['cooldown_bars'] = bars_in_cd
-            if bars_in_cd >= 2:
+            if bars_in_cd >= _cd_bars:
                 state['status'] = 'NORMAL'
                 state['status_changed'] = True
             else:
                 state['status'] = 'COOLDOWN'
                 state['status_changed'] = False
-            # But if rally returns during cooldown
-            if btc_z >= 1.0:
-                state['status'] = 'RALLY' if btc_z < 1.2 else 'DEEP_RALLY'
+            if btc_z >= _warn_z:
+                state['status'] = 'RALLY' if btc_z < _block_z else 'DEEP_RALLY'
                 state['cooldown_bars'] = 0
                 state['status_changed'] = True
         else:
             # NORMAL
-            if btc_z >= 1.2:
+            if btc_z >= _block_z:
                 state['status'] = 'DEEP_RALLY'
                 state['status_changed'] = True
-            elif btc_z >= 1.0:
+            elif btc_z >= _warn_z:
                 state['status'] = 'RALLY'
                 state['status_changed'] = True
             else:
@@ -544,13 +548,31 @@ class CryptoPairsScanner:
         try:
             markets = self.exchange.load_markets()
             
-            # v28: Try futures tickers, fallback to all tickers + filter
+            # v32: More robust ticker fetching — try multiple methods
+            tickers = {}
+            methods = []
+            
+            # Method 1: swap tickers
             try:
+                orig_type = self.exchange.options.get('defaultType', 'spot')
                 self.exchange.options['defaultType'] = 'swap'
                 tickers = self.exchange.fetch_tickers()
-                self.exchange.options['defaultType'] = 'spot'  # restore
+                self.exchange.options['defaultType'] = orig_type
+                methods.append('swap')
             except Exception:
-                tickers = self.exchange.fetch_tickers()
+                self.exchange.options['defaultType'] = 'spot'
+            
+            # Method 2: spot tickers (fallback or supplement)
+            if len(tickers) < 10:
+                try:
+                    spot_tickers = self.exchange.fetch_tickers()
+                    tickers.update(spot_tickers)
+                    methods.append('spot')
+                except Exception:
+                    pass
+            
+            if not tickers:
+                raise Exception("Не удалось получить тикеры")
             
             # v28: FUTURES — collect swap perpetual (/USDT:USDT) AND spot (/USDT)
             base_currency = 'USDT'
@@ -559,6 +581,8 @@ class CryptoPairsScanner:
             
             for k, v in tickers.items():
                 try:
+                    if v is None:
+                        continue
                     coin = k.split('/')[0]
                     if coin in seen_coins:
                         continue
@@ -567,11 +591,15 @@ class CryptoPairsScanner:
                     is_spot = f'/{base_currency}' in k and ':' not in k
                     if not is_swap and not is_spot:
                         continue
-                    volume = float(v.get('quoteVolume', 0) or v.get('volume', 0) or 0)
+                    volume = 0
+                    try:
+                        volume = float(v.get('quoteVolume', 0) or v.get('baseVolume', 0) or v.get('volume', 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
                     if volume > 0:
                         valid_pairs.append((coin, volume, is_swap))
                         seen_coins.add(coin)
-                except:
+                except Exception:
                     continue
             
             # Сортируем по объему
@@ -582,7 +610,7 @@ class CryptoPairsScanner:
             
             if len(top_coins) > 0:
                 _n_swap = sum(1 for p in sorted_pairs[:limit] if p[2])
-                st.info(f"📊 {len(top_coins)} монет ({_n_swap} futures + {len(top_coins)-_n_swap} spot) с {self.exchange_name.upper()}")
+                st.info(f"📊 {len(top_coins)} монет ({_n_swap} futures + {len(top_coins)-_n_swap} spot) с {self.exchange_name.upper()} ({', '.join(methods)})")
                 return top_coins
             else:
                 raise Exception("Не удалось получить данные о монетах")
@@ -597,25 +625,40 @@ class CryptoPairsScanner:
                    'NEAR', 'APT', 'ARB', 'OP', 'DOGE']
     
     def fetch_ohlcv(self, symbol, limit=None):
-        """Получить исторические данные с retry. v27: futures first, spot fallback."""
+        """Получить исторические данные с retry. v32: robust for all exchanges."""
         if limit is None:
             bars_per_day = {'1h': 24, '4h': 6, '1d': 1, '2h': 12, '15m': 96}.get(self.timeframe, 6)
             limit = self.lookback_days * bars_per_day
         
-        # v27: Try swap (futures) first, then spot
+        # v32: Try swap (futures) first, then spot — but only if exchange supports it
         symbols_to_try = []
         if ':' not in symbol:
-            symbols_to_try.append(symbol + ':USDT')  # BTC/USDT → BTC/USDT:USDT
-        symbols_to_try.append(symbol)  # fallback to original
+            # Only try swap format if exchange has swap markets
+            try:
+                swap_sym = symbol + ':USDT'
+                if swap_sym in self.exchange.markets or self.exchange_name in ('okx', 'bybit', 'binance'):
+                    symbols_to_try.append(swap_sym)
+            except Exception:
+                pass
+        symbols_to_try.append(symbol)  # fallback to original (spot)
         
         last_err = None
         for sym in symbols_to_try:
             for attempt in range(3):
                 try:
                     ohlcv = self.exchange.fetch_ohlcv(sym, self.timeframe, limit=limit)
+                    if not ohlcv or len(ohlcv) < 2:
+                        break  # try next symbol
+                    # v32: Validate OHLCV structure
+                    if len(ohlcv[0]) < 5:
+                        break
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                     df.set_index('timestamp', inplace=True)
+                    # v32: Drop NaN close prices
+                    df = df.dropna(subset=['close'])
+                    if len(df) < 20:
+                        break  # not enough data, try next symbol
                     return df['close']
                 except (ccxt.NetworkError, ccxt.RequestTimeout, ccxt.ExchangeNotAvailable) as e:
                     last_err = e
@@ -952,11 +995,26 @@ class CryptoPairsScanner:
         # v21: Build returns_dict for correlation filter AND PCA
         coin_list = list(price_data.keys())
         min_len = min(len(price_data[c]) for c in coin_list)
+        if min_len < 20:
+            st.error(f"❌ Недостаточно данных: минимальная длина серии {min_len} < 20")
+            return []
         returns_dict = {}
         for c in coin_list:
-            p = price_data[c].values[-min_len:]
-            r = np.diff(np.log(p + 1e-10))
-            returns_dict[c] = r
+            try:
+                p = price_data[c].values[-min_len:]
+                if len(p) < 2:
+                    continue
+                r = np.diff(np.log(p + 1e-10))
+                if len(r) > 0 and not np.all(np.isnan(r)):
+                    returns_dict[c] = r
+            except Exception:
+                continue
+        
+        # Update coin_list to only include coins with valid returns
+        coin_list = [c for c in coin_list if c in returns_dict]
+        if len(coin_list) < 2:
+            st.error("❌ Недостаточно монет с валидными данными")
+            return []
         
         # v10.4: Correlation pre-filter (ускорение в 3-5×)
         skip_pairs = set()
@@ -964,8 +1022,16 @@ class CryptoPairsScanner:
             
             for i, c1 in enumerate(coin_list):
                 for c2 in coin_list[i+1:]:
-                    rho = np.corrcoef(returns_dict[c1], returns_dict[c2])[0, 1]
-                    if abs(rho) < corr_prefilter:
+                    try:
+                        r1, r2 = returns_dict[c1], returns_dict[c2]
+                        min_r = min(len(r1), len(r2))
+                        if min_r < 10:
+                            skip_pairs.add((c1, c2))
+                            continue
+                        rho = np.corrcoef(r1[-min_r:], r2[-min_r:])[0, 1]
+                        if np.isnan(rho) or abs(rho) < corr_prefilter:
+                            skip_pairs.add((c1, c2))
+                    except Exception:
                         skip_pairs.add((c1, c2))
             
             if skip_pairs:
@@ -2382,15 +2448,18 @@ if st.session_state.pairs_data is not None:
     
     if rally_state.get('status') in ('RALLY', 'DEEP_RALLY', 'COOLDOWN'):
         _rl_z = rally_state.get('btc_z', 0)
+        _rl_warn = CFG('rally_filter', 'warning_z', 2.0)
+        _rl_block = CFG('rally_filter', 'block_z', 2.5)
+        _rl_cd = CFG('rally_filter', 'cooldown_bars', 2)
         if rally_state['status'] == 'DEEP_RALLY':
-            st.error(f"🚨 **DEEP RALLY FILTER** | BTC Z={_rl_z:+.2f} ≥ 1.2 | "
+            st.error(f"🚨 **DEEP RALLY FILTER** | BTC Z={_rl_z:+.2f} ≥ {_rl_block} | "
                      f"Все новые LONG-сигналы **ЗАБЛОКИРОВАНЫ**. Только SHORT разрешены.")
         elif rally_state['status'] == 'COOLDOWN':
             _cd_bars = rally_state.get('cooldown_bars', 0)
             st.warning(f"⏳ **RALLY COOLDOWN** | BTC Z={_rl_z:+.2f} | "
-                       f"Ожидание {2 - _cd_bars} бар(ов) перед разблокировкой LONG.")
+                       f"Ожидание {_rl_cd - _cd_bars} бар(ов) перед разблокировкой LONG.")
         else:
-            st.warning(f"⚠️ **RALLY FILTER** | BTC Z={_rl_z:+.2f} ≥ 1.0 | "
+            st.warning(f"⚠️ **RALLY FILTER** | BTC Z={_rl_z:+.2f} ≥ {_rl_warn} | "
                        f"LONG-сигналы под вопросом. Будьте осторожны.")
     
     # Separate by entry level
@@ -3745,6 +3814,8 @@ if st.session_state.pairs_data is not None:
             'ml_grade': _ml.get('grade', '?') if '_ml' in dir() else '?',
             'ml_score': _ml.get('score', 0) if '_ml' in dir() else 0,
             'risk_size_usdt': _size_usdt,
+            'intercept': round(selected_data.get('intercept', 0.0), 6),
+            'z_window': selected_data.get('z_window', 30),
             'notes': f"Q={selected_data.get('quality_score',0)} "
                      f"H={_hurst:.3f} HL={_hl:.0f}h "
                      f"μBT={_mbt:.0f}% "
