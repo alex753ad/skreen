@@ -39,6 +39,32 @@ from datetime import datetime, timedelta, timezone
 MSK = timezone(timedelta(hours=3))
 def now_msk():
     return datetime.now(MSK)
+
+def to_msk(dt_str):
+    """Convert ISO datetime string to HH:MM МСК."""
+    if not dt_str:
+        return ''
+    try:
+        dt = datetime.fromisoformat(str(dt_str))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=MSK)
+        msk_dt = dt.astimezone(MSK)
+        return msk_dt.strftime('%H:%M')
+    except Exception:
+        return str(dt_str)[-5:]
+
+def to_msk_full(dt_str):
+    """Convert ISO datetime string to DD.MM HH:MM МСК."""
+    if not dt_str:
+        return ''
+    try:
+        dt = datetime.fromisoformat(str(dt_str))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=MSK)
+        msk_dt = dt.astimezone(MSK)
+        return msk_dt.strftime('%d.%m %H:%M')
+    except Exception:
+        return str(dt_str)[:16]
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from statsmodels.tsa.stattools import coint
@@ -446,6 +472,7 @@ def save_trade_to_history(trade):
         'entry_price1', 'entry_price2', 'exit_price1', 'exit_price2',
         'notes', 'best_pnl', 'best_pnl_during_trade', 'recommended_size',
         'phantom_max_pnl', 'phantom_min_pnl',
+        'signal_type', 'entry_label', 'auto_opened',
     ]
     
     row = {
@@ -474,6 +501,9 @@ def save_trade_to_history(trade):
         'recommended_size': trade.get('recommended_size', 100),
         'phantom_max_pnl': trade.get('phantom_max_pnl'),
         'phantom_min_pnl': trade.get('phantom_min_pnl'),
+        'signal_type': trade.get('signal_type', ''),
+        'entry_label': trade.get('entry_label', ''),
+        'auto_opened': trade.get('auto_opened', False),
     }
     
     file_exists = os.path.exists(history_file)
@@ -966,7 +996,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📍 Pairs Position Monitor")
-st.caption("v19.0 | 24.02.2026 | Unified Config + Auto-refresh FIX + R8/R5 Smart Exit")
+st.caption("v23.0 | 26.02.2026 | Static Z-Score + Phantom Tracking + Commission + Position Sizing")
 
 # Sidebar
 with st.sidebar:
@@ -1554,10 +1584,17 @@ with tab2:
         # Table
         rows = []
         for p in reversed(closed_positions):
-            # v30: Trade basis
+            # v31: Trade basis with fallback from notes
             _basis = '👤' if not p.get('auto_opened') else '🤖'
             _sig = p.get('signal_type', '')
             _lbl = p.get('entry_label', '')
+            if not _sig and not _lbl:
+                _notes = str(p.get('notes', ''))
+                if 'SIGNAL' in _notes: _sig = 'SIGNAL'
+                elif 'READY' in _notes: _sig = 'READY'
+                if 'ВХОД' in _notes: _lbl = '🟢ВХОД'
+                elif 'УСЛОВНО' in _notes: _lbl = '🟡УСЛОВНО'
+                elif 'СЛАБЫЙ' in _notes: _lbl = '🟡СЛАБЫЙ'
             if _sig: _basis += f" {_sig}"
             if _lbl and len(_lbl) < 15: _basis += f" {_lbl}"
             
@@ -1570,8 +1607,8 @@ with tab2:
                 'Exit Z': f"{p.get('exit_z', 0):+.2f}",
                 'P&L %': f"{p.get('pnl_pct', 0):+.2f}",
                 'Причина': p.get('exit_reason', ''),
-                'Вход': p['entry_time'][:16],
-                'Выход': p.get('exit_time', '')[:16] if p.get('exit_time') else '',
+                'Вход МСК': to_msk_full(p.get('entry_time', '')),
+                'Выход МСК': to_msk_full(p.get('exit_time', '')),
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         
@@ -1631,6 +1668,54 @@ with tab2:
                             st.caption(f"{_e} {pair}: {v['n']} шт, total={v['total']:+.2f}%, WR={v['wr']:.0f}%")
         except Exception:
             pass
+        
+        # v31: Pattern Analysis by Signal Basis (local, from history)
+        if len(closed_positions) >= 3:
+            with st.expander("🔬 Pattern Analysis по основанию сделки", expanded=False):
+                # Analyze by signal type (SIGNAL vs READY)
+                _by_sig = {}
+                _by_readiness = {}
+                for cp in closed_positions:
+                    _pnl = cp.get('pnl_pct', 0)
+                    # Signal type
+                    _st = cp.get('signal_type', '')
+                    if not _st:
+                        _notes = str(cp.get('notes', ''))
+                        if 'SIGNAL' in _notes: _st = 'SIGNAL'
+                        elif 'READY' in _notes: _st = 'READY'
+                        else: _st = 'UNKNOWN'
+                    if _st not in _by_sig: _by_sig[_st] = []
+                    _by_sig[_st].append(_pnl)
+                    # Entry readiness
+                    _er = cp.get('entry_label', '')
+                    if not _er:
+                        _notes = str(cp.get('notes', ''))
+                        if 'ВХОД' in _notes: _er = '🟢 ВХОД'
+                        elif 'УСЛОВНО' in _notes: _er = '🟡 УСЛОВНО'
+                        elif 'СЛАБЫЙ' in _notes: _er = '🟡 СЛАБЫЙ'
+                        else: _er = 'НЕ УКАЗАНО'
+                    if _er not in _by_readiness: _by_readiness[_er] = []
+                    _by_readiness[_er].append(_pnl)
+                
+                bs1, bs2 = st.columns(2)
+                with bs1:
+                    st.markdown("**📊 По типу сигнала**")
+                    for sig, pnls in sorted(_by_sig.items()):
+                        n = len(pnls)
+                        if n == 0: continue
+                        wr = sum(1 for p in pnls if p > 0) / n * 100
+                        avg = np.mean(pnls)
+                        _e = '🟢' if avg > 0 else '🔴'
+                        st.caption(f"{_e} {sig}: {n} шт, WR={wr:.0f}%, avg={avg:+.2f}%")
+                with bs2:
+                    st.markdown("**🎯 По готовности входа**")
+                    for er, pnls in sorted(_by_readiness.items()):
+                        n = len(pnls)
+                        if n == 0: continue
+                        wr = sum(1 for p in pnls if p > 0) / n * 100
+                        avg = np.mean(pnls)
+                        _e = '🟢' if avg > 0 else '🔴'
+                        st.caption(f"{_e} {er}: {n} шт, WR={wr:.0f}%, avg={avg:+.2f}%")
         
         # v5.1: CSV export with date in filename
         csv_history = pd.DataFrame(rows).to_csv(index=False)
@@ -1886,6 +1971,7 @@ with tab3:
                     'Dir': pos['direction'],
                     'Entry Z': f"{mon['z_entry']:+.2f}",
                     'Now Z': f"{mon['z_now']:+.2f}",
+                    'Z Static': f"{mon.get('z_static', mon['z_now']):+.2f}",
                     'P&L': f"{mon['pnl_pct']:+.3f}%",
                     'Z→0': '✅' if mon['z_towards_zero'] else '❌',
                     'Часов': f"{hours_in:.1f}",
@@ -1893,6 +1979,52 @@ with tab3:
                 })
         if pnl_data:
             st.dataframe(pd.DataFrame(pnl_data), use_container_width=True, hide_index=True)
+        
+        # v31: Close buttons per position
+        st.markdown("#### ❌ Закрытие позиций")
+        close_cols = st.columns(min(len(open_positions) + 1, 6))
+        
+        for i, pos in enumerate(open_positions):
+            col_idx = i % (len(close_cols) - 1) if len(close_cols) > 1 else 0
+            mon = mon_cache.get(pos['id'])
+            if mon:
+                with close_cols[col_idx]:
+                    pair = f"{pos['coin1']}/{pos['coin2']}"
+                    pnl_str = f"{mon['pnl_pct']:+.2f}%"
+                    if st.button(f"❌ #{pos['id']} {pair} ({pnl_str})", 
+                                key=f"portfolio_close_{pos['id']}"):
+                        close_position(pos['id'], mon['price1_now'], mon['price2_now'],
+                                      mon['z_now'], 'MANUAL (портфель)',
+                                      exit_z_static=mon.get('z_static'))
+                        st.success(f"✅ Закрыта #{pos['id']} {pair} | P&L: {pnl_str}")
+                        st.rerun()
+        
+        # v31: Close ALL button
+        if len(open_positions) > 1:
+            with close_cols[-1]:
+                if st.button("🔴 ЗАКРЫТЬ ВСЕ", key="close_all_portfolio", type="primary"):
+                    st.session_state['_confirm_close_all'] = True
+            
+            if st.session_state.get('_confirm_close_all'):
+                st.warning("⚠️ **Вы уверены?** Это закроет ВСЕ открытые позиции!")
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    if st.button("✅ ДА, закрыть все", key="confirm_close_all"):
+                        closed_count = 0
+                        for pos in open_positions:
+                            mon = mon_cache.get(pos['id'])
+                            if mon:
+                                close_position(pos['id'], mon['price1_now'], mon['price2_now'],
+                                              mon['z_now'], 'CLOSE ALL',
+                                              exit_z_static=mon.get('z_static'))
+                                closed_count += 1
+                        st.session_state['_confirm_close_all'] = False
+                        st.success(f"✅ Закрыто {closed_count} позиций")
+                        st.rerun()
+                with cc2:
+                    if st.button("❌ Отмена", key="cancel_close_all"):
+                        st.session_state['_confirm_close_all'] = False
+                        st.rerun()
         
         # === 6. Quick recommendations ===
         st.markdown("#### 💡 Рекомендации")
@@ -2204,10 +2336,39 @@ with tab4:
             if ph_max is not None:
                 delta_ph = ph_max - t_pnl
                 cut = f"+{delta_ph:.2f}%" if delta_ph > 0.1 else "✅"
+            # v31: Основание сделки
+            _sig = t.get('signal_type', '')
+            _lbl = t.get('entry_label', '')
+            _auto = t.get('auto_opened', False)
+            _basis_parts = []
+            if _auto:
+                _basis_parts.append('🤖')
+            else:
+                _basis_parts.append('👤')
+            if _sig:
+                _basis_parts.append(f"📊{_sig}")
+            if _lbl:
+                _basis_parts.append(_lbl)
+            # Fallback: parse from notes
+            if not _sig and not _lbl:
+                _notes = str(t.get('notes', ''))
+                if 'SIGNAL' in _notes:
+                    _basis_parts.append('📊SIGNAL')
+                elif 'READY' in _notes:
+                    _basis_parts.append('📊READY')
+                if 'ВХОД' in _notes:
+                    _basis_parts.append('🟢ВХОД')
+                elif 'УСЛОВНО' in _notes:
+                    _basis_parts.append('🟡УСЛОВНО')
+                elif 'СЛАБЫЙ' in _notes:
+                    _basis_parts.append('🟡СЛАБЫЙ')
+            _basis = ' '.join(_basis_parts)
+            
             trade_rows.append({
                 '#': t.get('id', ''),
                 'Пара': t.get('pair', ''),
                 'Dir': t.get('direction', ''),
+                'Основание': _basis,
                 'Size $': t.get('recommended_size', 100),
                 'Entry Z': f"{float(t.get('entry_z', 0)):+.2f}",
                 'Exit Z': f"{float(t.get('exit_z', 0)):+.2f}",
@@ -2215,8 +2376,8 @@ with tab4:
                 'Best P&L': f"{float(t.get('best_pnl_during_trade', t.get('best_pnl', 0))):+.2f}%",
                 'Упущено': cut,
                 'Причина': t.get('exit_reason', ''),
-                'Вход': str(t.get('entry_time', ''))[-5:],
-                'Выход': str(t.get('exit_time', ''))[-5:],
+                'Вход МСК': to_msk_full(t.get('entry_time', '')),
+                'Выход МСК': to_msk_full(t.get('exit_time', '')),
             })
         if trade_rows:
             st.dataframe(pd.DataFrame(trade_rows), use_container_width=True, hide_index=True)
