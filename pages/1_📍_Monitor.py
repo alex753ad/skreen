@@ -22,15 +22,21 @@ try:
     from config_loader import CFG
 except ImportError:
     def CFG(section, key=None, default=None):
-        _d = {'strategy': {'entry_z': 1.8, 'exit_z': 0.8, 'stop_z_offset': 2.0,
-              'min_stop_z': 4.0, 'max_hold_hours': 72, 'commission_pct': 0.10},
+        _d = {'strategy': {'entry_z': 1.8, 'exit_z': 0.5, 'stop_z_offset': 2.0,
+              'min_stop_z': 4.0, 'max_hold_hours': 3, 'commission_pct': 0.10},
               'monitor': {'refresh_interval_sec': 120, 'exit_z_target': 0.5,
-              'pnl_stop_pct': -5.0, 'hurst_critical': 0.50, 'hurst_warning': 0.48,
+              'pnl_stop_pct': -1.2, 'hurst_critical': 0.50, 'hurst_warning': 0.48,
               'hurst_border': 0.45, 'pvalue_warning': 0.10, 'correlation_warning': 0.20,
               'trailing_z_bounce': 0.8, 'time_warning_ratio': 1.0,
               'time_exit_ratio': 1.5, 'time_critical_ratio': 2.0,
               'overshoot_deep_z': 1.0, 'pnl_trailing_threshold': 0.5,
-              'pnl_trailing_fraction': 0.4}}
+              'pnl_trailing_fraction': 0.4,
+              'auto_exit_enabled': True, 'auto_tp_pct': 0.8, 'auto_sl_pct': -1.2,
+              'auto_exit_z': 0.3, 'auto_exit_z_min_pnl': 0.3,
+              'trailing_enabled': True, 'trailing_activate_pct': 0.5, 'trailing_drawdown_pct': 0.25,
+              'auto_flip_enabled': True, 'pair_cooldown_hours': 4, 'pair_loss_limit_pct': -2.0,
+              'coin_loss_warn_pct': -3.0, 'daily_loss_limit_pct': -5.0,
+              'max_positions': 10, 'max_coin_exposure': 4, 'entry_grace_minutes': 15}}
         if key is None:
             return _d.get(section, {})
         return _d.get(section, {}).get(key, default)
@@ -161,8 +167,143 @@ def assess_entry_readiness(p):
 # CORE MATH (standalone — не зависит от analysis module)
 # ═══════════════════════════════════════════════════════
 
-# v23.0: Commission round-trip (4 legs × 0.1% per leg)
-COMMISSION_ROUND_TRIP_PCT = 0.40
+# v23.0: Commission round-trip (4 legs × commission_pct per leg)
+COMMISSION_ROUND_TRIP_PCT = CFG('strategy', 'commission_pct', 0.10) * 4  # default 0.40
+
+# ═══════════════════════════════════════════════════════
+# v32: PAIR COOLDOWN & LOSS TRACKING
+# ═══════════════════════════════════════════════════════
+COOLDOWN_FILE = "pair_cooldowns.json"
+
+def _load_cooldowns():
+    if os.path.exists(COOLDOWN_FILE):
+        try:
+            with open(COOLDOWN_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def _save_cooldowns(data):
+    with open(COOLDOWN_FILE, 'w') as f:
+        json.dump(data, f, indent=2, default=str)
+
+def record_trade_for_cooldown(pair_name, pnl_pct, direction):
+    """Record closed trade for cooldown tracking."""
+    cd = _load_cooldowns()
+    today = now_msk().strftime('%Y-%m-%d')
+    if pair_name not in cd:
+        cd[pair_name] = {'session_pnl': 0, 'last_loss_time': None, 'last_dir': None, 'date': today}
+    # Reset if new day
+    if cd[pair_name].get('date') != today:
+        cd[pair_name] = {'session_pnl': 0, 'last_loss_time': None, 'last_dir': None, 'date': today}
+    cd[pair_name]['session_pnl'] = round(cd[pair_name].get('session_pnl', 0) + pnl_pct, 3)
+    if pnl_pct < 0:
+        cd[pair_name]['last_loss_time'] = now_msk().isoformat()
+    cd[pair_name]['last_dir'] = direction
+    _save_cooldowns(cd)
+
+def check_pair_cooldown(pair_name):
+    """Check if pair is in cooldown. Returns (blocked, reason)."""
+    cd = _load_cooldowns()
+    today = now_msk().strftime('%Y-%m-%d')
+    entry = cd.get(pair_name, {})
+    if entry.get('date') != today:
+        return False, ""
+    # 1. Pair loss limit
+    pair_limit = CFG('monitor', 'pair_loss_limit_pct', -2.0)
+    if entry.get('session_pnl', 0) <= pair_limit:
+        return True, f"🚫 {pair_name}: потери {entry['session_pnl']:+.2f}% за сессию (лимит {pair_limit}%)"
+    # 2. Cooldown after loss
+    if entry.get('last_loss_time'):
+        try:
+            loss_dt = datetime.fromisoformat(entry['last_loss_time'])
+            hours_since = (now_msk() - loss_dt).total_seconds() / 3600
+            cooldown_h = CFG('monitor', 'pair_cooldown_hours', 4)
+            if hours_since < cooldown_h:
+                remaining = cooldown_h - hours_since
+                return True, f"⏳ {pair_name}: cooldown {remaining:.1f}ч (убыток в {loss_dt.strftime('%H:%M')})"
+        except Exception:
+            pass
+    return False, ""
+
+def check_daily_loss_limit():
+    """Check if total daily losses exceeded limit."""
+    cd = _load_cooldowns()
+    today = now_msk().strftime('%Y-%m-%d')
+    total_pnl = sum(e.get('session_pnl', 0) for e in cd.values() if e.get('date') == today)
+    limit = CFG('monitor', 'daily_loss_limit_pct', -5.0)
+    if total_pnl <= limit:
+        return True, f"🛑 ДНЕВНОЙ ЛИМИТ: потери {total_pnl:+.2f}% (лимит {limit}%)"
+    return False, ""
+
+def check_coin_losses(coin):
+    """Check total losses for a single coin across all pairs."""
+    cd = _load_cooldowns()
+    today = now_msk().strftime('%Y-%m-%d')
+    total = 0
+    for pair, entry in cd.items():
+        if entry.get('date') != today:
+            continue
+        if coin in pair.split('/'):
+            total += entry.get('session_pnl', 0)
+    warn_limit = CFG('monitor', 'coin_loss_warn_pct', -3.0)
+    if total <= warn_limit:
+        return True, f"⚠️ {coin}: суммарные потери {total:+.2f}% (порог {warn_limit}%)"
+    return False, ""
+
+# ═══════════════════════════════════════════════════════
+# v32: AUTO-EXIT ENGINE
+# ═══════════════════════════════════════════════════════
+def check_auto_exit(pos, mon):
+    """Check if position should be auto-closed. Returns (should_close, reason) or (False, None)."""
+    if not CFG('monitor', 'auto_exit_enabled', True):
+        return False, None
+
+    pnl = mon.get('pnl_pct', 0)
+    z_static = mon.get('z_static', mon.get('z_now', 0))
+    best_pnl = mon.get('best_pnl', 0)
+    hours_in = mon.get('hours_in', 0)
+
+    # 0. Entry grace period — suppress exit signals
+    grace_min = CFG('monitor', 'entry_grace_minutes', 15)
+    if hours_in < grace_min / 60:
+        return False, None
+
+    # 1. Stop Loss (highest priority)
+    sl = CFG('monitor', 'auto_sl_pct', -1.2)
+    if pnl <= sl:
+        return True, f"AUTO_SL: P&L={pnl:+.2f}% ≤ {sl}%"
+
+    # 2. Take Profit
+    tp = CFG('monitor', 'auto_tp_pct', 0.8)
+    if pnl >= tp:
+        return True, f"AUTO_TP: P&L={pnl:+.2f}% ≥ {tp}%"
+
+    # 3. Z-based exit (Z near zero AND profitable)
+    z_exit_thresh = CFG('monitor', 'auto_exit_z', 0.3)
+    z_min_pnl = CFG('monitor', 'auto_exit_z_min_pnl', 0.3)
+    if abs(z_static) <= z_exit_thresh and pnl >= z_min_pnl:
+        return True, f"AUTO_Z: |Z|={abs(z_static):.2f} ≤ {z_exit_thresh}, P&L={pnl:+.2f}%"
+
+    # 4. Trailing Stop
+    if CFG('monitor', 'trailing_enabled', True):
+        trail_act = CFG('monitor', 'trailing_activate_pct', 0.5)
+        trail_dd = CFG('monitor', 'trailing_drawdown_pct', 0.25)
+        if best_pnl >= trail_act and (best_pnl - pnl) >= trail_dd:
+            return True, f"AUTO_TRAIL: peak={best_pnl:+.2f}%, now={pnl:+.2f}%, drop={best_pnl-pnl:.2f}%"
+
+    # 5. P&L stop from position config (legacy, usually wider)
+    pnl_stop = pos.get('pnl_stop_pct', -5.0)
+    if pnl <= pnl_stop:
+        return True, f"AUTO_PNLSTOP: P&L={pnl:+.2f}% ≤ {pnl_stop}%"
+
+    # 6. Timeout
+    max_hours = pos.get('max_hold_hours', CFG('strategy', 'max_hold_hours', 3))
+    if hours_in > max_hours:
+        return True, f"AUTO_TIMEOUT: {hours_in:.1f}ч > {max_hours}ч"
+
+    return False, None
 
 
 def calc_static_spread(p1_arr, p2_arr, entry_hr, entry_intercept=0.0):
@@ -361,13 +502,75 @@ def save_positions(positions):
 def add_position(coin1, coin2, direction, entry_z, entry_hr, 
                  entry_price1, entry_price2, timeframe, notes="",
                  max_hold_hours=None, pnl_stop_pct=None,
-                 entry_intercept=0.0, recommended_size=100.0):
+                 entry_intercept=0.0, recommended_size=100.0,
+                 z_window=None):
     positions = load_positions()
+    open_positions = [p for p in positions if p['status'] == 'OPEN']
+
+    # v32: Check daily loss limit
+    daily_blocked, daily_reason = check_daily_loss_limit()
+    if daily_blocked:
+        st.error(daily_reason)
+        return None
+
+    # v32: Check max positions limit
+    max_pos = CFG('monitor', 'max_positions', 10)
+    if len(open_positions) >= max_pos:
+        st.error(f"🚫 Достигнут лимит открытых позиций: {len(open_positions)}/{max_pos}")
+        return None
+
+    pair_name = f"{coin1}/{coin2}"
+    pair_name_rev = f"{coin2}/{coin1}"
+
+    # v32: Check pair cooldown
+    cd_blocked, cd_reason = check_pair_cooldown(pair_name)
+    if not cd_blocked:
+        cd_blocked, cd_reason = check_pair_cooldown(pair_name_rev)
+    if cd_blocked:
+        st.warning(cd_reason)
+        return None
+
+    # v32: Check coin losses (warning only, not blocking)
+    for coin in [coin1, coin2]:
+        coin_warn, coin_msg = check_coin_losses(coin)
+        if coin_warn:
+            st.warning(coin_msg)
+
+    # v32: AUTO-FLIP — close conflicting positions
+    if CFG('monitor', 'auto_flip_enabled', True):
+        coins_new = {coin1, coin2}
+        flipped = []
+        for pos in open_positions:
+            coins_existing = {pos['coin1'], pos['coin2']}
+            overlap = coins_new & coins_existing
+            # Same pair, opposite direction → flip
+            if ({pos['coin1'], pos['coin2']} == {coin1, coin2}) and pos['direction'] != direction:
+                try:
+                    # Get current prices for P&L calculation
+                    ep1 = entry_price1  # use new entry prices as proxy
+                    ep2 = entry_price2
+                    close_position(pos['id'], ep1, ep2, entry_z,
+                                   f"AUTO_FLIP: {direction} сигнал")
+                    flipped.append(f"#{pos['id']} {pos['coin1']}/{pos['coin2']} {pos['direction']}")
+                except Exception as ex:
+                    st.warning(f"⚠️ Не удалось закрыть #{pos['id']} для flip: {ex}")
+            # Same coin in different pair, opposite direction on that coin → warn
+            elif overlap and pos['direction'] != direction:
+                st.warning(
+                    f"⚠️ КОНФЛИКТ: {', '.join(overlap)} уже в #{pos['id']} "
+                    f"{pos['coin1']}/{pos['coin2']} {pos['direction']}. "
+                    f"Новая: {pair_name} {direction}. Проверьте экспозицию."
+                )
+        if flipped:
+            st.info(f"🔄 AUTO-FLIP: закрыты {', '.join(flipped)} → новый {direction} {pair_name}")
+            # Reload after closing
+            positions = load_positions()
+
     # v27: defaults from unified config
     if max_hold_hours is None:
-        max_hold_hours = CFG('strategy', 'max_hold_hours', 72)
+        max_hold_hours = CFG('strategy', 'max_hold_hours', 3)
     if pnl_stop_pct is None:
-        pnl_stop_pct = CFG('monitor', 'pnl_stop_pct', -5.0)
+        pnl_stop_pct = CFG('monitor', 'pnl_stop_pct', -1.2)
     # v5.0: Adaptive stop_z — at least offset Z-units beyond entry
     _stop_offset = CFG('strategy', 'stop_z_offset', 2.0)
     _min_stop = CFG('strategy', 'min_stop_z', 4.0)
@@ -391,6 +594,7 @@ def add_position(coin1, coin2, direction, entry_z, entry_hr,
         'pnl_stop_pct': pnl_stop_pct,
         'recommended_size': recommended_size,  # v23.0: position sizing
         'best_pnl_during_trade': 0.0,  # v23.0: best P&L (after commission)
+        'z_window': z_window,  # v32: from scanner for consistency
     }
     positions.append(pos)
     save_positions(positions)
@@ -436,6 +640,12 @@ def close_position(pos_id, exit_price1, exit_price2, exit_z, reason,
     if closed_pos:
         try:
             save_trade_to_history(closed_pos)
+        except Exception:
+            pass
+        # v32: Record trade for cooldown tracking
+        try:
+            _pair = f"{closed_pos['coin1']}/{closed_pos['coin2']}"
+            record_trade_for_cooldown(_pair, closed_pos.get('pnl_pct', 0), closed_pos.get('direction', ''))
         except Exception:
             pass
         # v27: Update pair memory
@@ -790,10 +1000,17 @@ def monitor_position(pos, exchange_name):
     # v5.0: Adaptive stop — at least 2.0 Z-units beyond entry, minimum 4.0
     default_stop = max(abs(pos['entry_z']) + 2.0, 4.0)
     sz = pos.get('stop_z', default_stop)
-    max_hours = pos.get('max_hold_hours', 72)
-    pnl_stop = pos.get('pnl_stop_pct', -5.0)
+    max_hours = pos.get('max_hold_hours', CFG('strategy', 'max_hold_hours', 3))
+    pnl_stop = pos.get('pnl_stop_pct', CFG('monitor', 'pnl_stop_pct', -1.2))
     
-    if pos['direction'] == 'LONG':
+    # v32: Entry grace period — suppress exit signals for first N minutes
+    grace_min = CFG('monitor', 'entry_grace_minutes', 15)
+    in_grace = hours_in < grace_min / 60
+    
+    if in_grace:
+        exit_signal = f"⏳ Grace period: {grace_min - hours_in*60:.0f} мин до мониторинга"
+        exit_urgency = 0
+    elif pos['direction'] == 'LONG':
         if z_exit >= -ez and z_exit <= ez:
             # v16: Check PnL before declaring convergence (рассуждение #1)
             # v18: Also check GARCH Z — if GARCH still far, it's variance collapse
@@ -836,19 +1053,20 @@ def monitor_position(pos, exchange_name):
             exit_signal = '🛑 STOP LOSS (static Z) — экстренный выход!'
             exit_urgency = 2
     
-    # P&L stop
-    if pnl_pct <= pnl_stop and exit_urgency < 2:
-        exit_signal = f'🛑 STOP LOSS (P&L {pnl_pct:.1f}% < {pnl_stop:.0f}%) — выход!'
+    # P&L stop (active even during grace for extreme losses)
+    if pnl_pct <= pnl_stop and exit_urgency < 2 and not in_grace:
+        exit_signal = f'🛑 STOP LOSS (P&L {pnl_pct:.1f}% < {pnl_stop:.1f}%) — выход!'
         exit_urgency = 2
     
     # Time-based
-    if hours_in > max_hours and exit_urgency < 2:
-        if exit_signal is None:
-            exit_signal = f'⏰ TIMEOUT ({hours_in:.0f}ч > {max_hours:.0f}ч) — рассмотрите выход'
+    if not in_grace:
+        if hours_in > max_hours and exit_urgency < 2:
+            if exit_signal is None:
+                exit_signal = f'⏰ TIMEOUT ({hours_in:.1f}ч > {max_hours:.0f}ч) — рассмотрите выход'
+                exit_urgency = 1
+        elif hours_in > max_hours * 0.75 and exit_urgency == 0:
+            exit_signal = f'⚠️ Позиция открыта {hours_in:.1f}ч (лимит {max_hours:.0f}ч)'
             exit_urgency = 1
-    elif hours_in > max_hours * 0.75 and exit_urgency == 0:
-        exit_signal = f'⚠️ Позиция открыта {hours_in:.0f}ч (лимит {max_hours:.0f}ч)'
-        exit_urgency = 1
     
     # v27: Quality warnings — thresholds from unified config
     quality_warnings = []
@@ -1064,14 +1282,23 @@ with st.sidebar:
                             p1 = get_current_price(exchange, imp['coin1']) or 0
                             p2 = get_current_price(exchange, imp['coin2']) or 0
                         if p1 > 0 and p2 > 0:
+                            _rec_size = imp.get('risk_size_usdt', imp.get('recommended_size', 100))
+                            _intercept = imp.get('intercept', imp.get('entry_intercept', 0.0))
+                            _zw = imp.get('z_window', None)
                             pos = add_position(
                                 imp['coin1'], imp['coin2'], imp['direction'],
                                 imp['entry_z'], imp['entry_hr'],
                                 p1, p2, imp.get('timeframe', '4h'),
-                                imp.get('notes', ''))
-                            st.success(f"✅ #{pos['id']} {pair_name} добавлена!")
-                            import os; os.remove(pf)
-                            st.rerun()
+                                imp.get('notes', ''),
+                                entry_intercept=_intercept,
+                                recommended_size=_rec_size,
+                                z_window=_zw)
+                            if pos:
+                                st.success(f"✅ #{pos['id']} {pair_name} добавлена! 💰 ${_rec_size:.0f}")
+                                import os; os.remove(pf)
+                                st.rerun()
+                            else:
+                                st.warning("⚠️ Позиция не открыта (лимит/cooldown)")
                         else:
                             st.error("Не удалось получить цены")
             except Exception as ex:
@@ -1090,11 +1317,20 @@ with st.sidebar:
                     p1 = imp.get('entry_price1', 0) or get_current_price(exchange, imp['coin1']) or 0
                     p2 = imp.get('entry_price2', 0) or get_current_price(exchange, imp['coin2']) or 0
                     if p1 > 0 and p2 > 0:
+                        _rec_size = imp.get('risk_size_usdt', imp.get('recommended_size', 100))
+                        _intercept = imp.get('intercept', imp.get('entry_intercept', 0.0))
+                        _zw = imp.get('z_window', None)
                         pos = add_position(imp['coin1'], imp['coin2'], imp['direction'],
                                          imp['entry_z'], imp['entry_hr'], p1, p2,
-                                         imp.get('timeframe', '4h'), imp.get('notes', ''))
-                        st.success(f"✅ #{pos['id']} импортирована!")
-                        st.rerun()
+                                         imp.get('timeframe', '4h'), imp.get('notes', ''),
+                                         entry_intercept=_intercept,
+                                         recommended_size=_rec_size,
+                                         z_window=_zw)
+                        if pos:
+                            st.success(f"✅ #{pos['id']} импортирована! 💰 ${_rec_size:.0f}")
+                            st.rerun()
+                        else:
+                            st.warning("⚠️ Позиция не открыта (лимит/cooldown)")
         except Exception as ex:
             st.error(f"Ошибка JSON: {ex}")
     
@@ -1132,9 +1368,9 @@ with st.sidebar:
         st.markdown("**⚠️ Риск-менеджмент**")
         col_r1, col_r2 = st.columns(2)
         with col_r1:
-            new_max_hours = st.number_input("Max часов в позиции", value=72, step=12)
+            new_max_hours = st.number_input("Max часов в позиции", value=int(CFG('strategy', 'max_hold_hours', 3)), step=1)
         with col_r2:
-            new_pnl_stop = st.number_input("P&L Stop (%)", value=-5.0, step=0.5)
+            new_pnl_stop = st.number_input("P&L Stop (%)", value=float(CFG('monitor', 'pnl_stop_pct', -1.2)), step=0.1)
         
         # Автозагрузка цен
         fetch_prices_btn = st.form_submit_button("📥 Загрузить цены + Добавить")
@@ -1167,8 +1403,11 @@ with st.sidebar:
                              max_hold_hours=new_max_hours,
                              pnl_stop_pct=new_pnl_stop,
                              entry_intercept=new_intercept)
-            st.success(f"✅ Позиция #{pos['id']} добавлена: {new_dir} {new_c1}/{new_c2} | 💰 ${pos.get('recommended_size', 100):.0f}")
-            st.rerun()
+            if pos:
+                st.success(f"✅ Позиция #{pos['id']} добавлена: {new_dir} {new_c1}/{new_c2} | 💰 ${pos.get('recommended_size', 100):.0f}")
+                st.rerun()
+            else:
+                st.warning("⚠️ Позиция не открыта (лимит/cooldown/daily loss)")
 
 # ═══════ MAIN AREA ═══════
 positions = load_positions()
@@ -1224,6 +1463,21 @@ with tab1:
                         pass
                 
                 # Exit signal banner
+                # v32: AUTO-EXIT — check and auto-close if criteria met
+                _auto_close, _auto_reason = check_auto_exit(pos, mon)
+                if _auto_close:
+                    st.warning(f"🤖 AUTO-EXIT: {_auto_reason}")
+                    try:
+                        close_position(
+                            pos['id'], mon['price1_now'], mon['price2_now'],
+                            mon.get('z_static', mon['z_now']),
+                            _auto_reason,
+                            exit_z_static=mon.get('z_static'))
+                        st.success(f"✅ #{pos['id']} {pair_name} закрыта автоматически | P&L: {mon['pnl_pct']:+.2f}%")
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"❌ Ошибка авто-закрытия: {ex}")
+                
                 if mon['exit_signal']:
                     if 'STOP' in mon['exit_signal'] or 'СРОЧН' in str(mon['exit_signal']):
                         st.error(mon['exit_signal'])
@@ -1572,7 +1826,7 @@ with tab2:
         st.info("📭 Нет закрытых позиций")
     else:
         # Summary
-        pnls = [p.get('pnl_pct', 0) for p in closed_positions]
+        pnls = [float(p.get('pnl_pct', 0) or 0) for p in closed_positions]
         wins = [p for p in pnls if p > 0]
         
         sc1, sc2, sc3, sc4 = st.columns(4)
@@ -1676,7 +1930,7 @@ with tab2:
                 _by_sig = {}
                 _by_readiness = {}
                 for cp in closed_positions:
-                    _pnl = cp.get('pnl_pct', 0)
+                    _pnl = float(cp.get('pnl_pct', 0) or 0)
                     # Signal type
                     _st = cp.get('signal_type', '')
                     if not _st:
@@ -1779,9 +2033,11 @@ with tab_phantom:
                             if pp['id'] == ph['id']:
                                 pp['phantom_last_pnl'] = phantom_pnl
                                 pp['phantom_last_check'] = now_msk().isoformat()
-                                if phantom_pnl > (pp.get('phantom_max_pnl') or -999):
+                                _pm = float(pp.get('phantom_max_pnl') or -999)
+                                if phantom_pnl > _pm:
                                     pp['phantom_max_pnl'] = phantom_pnl
-                                if phantom_pnl < (pp.get('phantom_min_pnl') or 999):
+                                _pn = float(pp.get('phantom_min_pnl') or 999)
+                                if phantom_pnl < _pn:
                                     pp['phantom_min_pnl'] = phantom_pnl
                                 ph.update(pp)  # sync back
                         save_positions(all_pos)
@@ -1792,9 +2048,9 @@ with tab_phantom:
         for ph in active_phantoms + expired_phantoms[:5]:
             is_active = ph in active_phantoms
             pair_name = f"{ph['coin1']}/{ph['coin2']}"
-            exit_pnl = ph.get('pnl_pct', 0)
-            phantom_max = ph.get('phantom_max_pnl', exit_pnl)
-            phantom_last = ph.get('phantom_last_pnl', exit_pnl)
+            exit_pnl = float(ph.get('pnl_pct', 0) or 0)
+            phantom_max = float(ph.get('phantom_max_pnl', exit_pnl) or exit_pnl)
+            phantom_last = float(ph.get('phantom_last_pnl', exit_pnl) or exit_pnl)
             left_on_table = max(0, phantom_max - exit_pnl) if phantom_max else 0
             
             status_emoji = "👻" if is_active else "💀"
@@ -1806,7 +2062,7 @@ with tab_phantom:
                           delta=f"{phantom_last - exit_pnl:+.2f}% vs выход")
                 h3.metric("Phantom MAX", f"{phantom_max:+.2f}%",
                           delta=f"+{left_on_table:.2f}% упущено" if left_on_table > 0.1 else "✅ не упущено")
-                h4.metric("Best во время сделки", f"{ph.get('best_pnl_during_trade', ph.get('best_pnl', 0)):+.2f}%")
+                h4.metric("Best во время сделки", f"{float(ph.get('best_pnl_during_trade', ph.get('best_pnl', 0)) or 0):+.2f}%")
                 
                 if is_active:
                     try:
@@ -1904,8 +2160,8 @@ with tab3:
         # === 4. RISK LIMITS CHECK ===
         st.markdown("#### ⚠️ Лимиты риска")
         
-        MAX_POSITIONS = 6
-        MAX_COIN_EXPOSURE = 3  # max positions per coin
+        MAX_POSITIONS = CFG('monitor', 'max_positions', 10)
+        MAX_COIN_EXPOSURE = CFG('monitor', 'max_coin_exposure', 4)
         MAX_CONCENTRATION_PCT = 40  # max % of portfolio in one coin
         
         lc1, lc2, lc3 = st.columns(3)
@@ -2332,10 +2588,14 @@ with tab4:
             # v23.0: Phantom "left on table" calculation
             cut = ''
             ph_max = t.get('phantom_max_pnl')
-            t_pnl = float(t.get('pnl_pct', 0))
+            t_pnl = float(t.get('pnl_pct', 0) or 0)
             if ph_max is not None:
-                delta_ph = ph_max - t_pnl
-                cut = f"+{delta_ph:.2f}%" if delta_ph > 0.1 else "✅"
+                try:
+                    ph_max = float(ph_max)
+                    delta_ph = ph_max - t_pnl
+                    cut = f"+{delta_ph:.2f}%" if delta_ph > 0.1 else "✅"
+                except (TypeError, ValueError):
+                    cut = ''
             # v31: Основание сделки
             _sig = t.get('signal_type', '')
             _lbl = t.get('entry_label', '')
