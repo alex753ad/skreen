@@ -1,13 +1,19 @@
 """
-Pairs Position Monitor v23.0 (continues from v22.0 monitor line)
-v23.0: Static Z-score (CRITICAL fix), Phantom Tracking, Position Sizing, Commission
-  - Dual Z: z_static (entry HR) for exit signals, z_dynamic (Kalman) for health
-  - Phantom tracking 24h post-close: did I cut profit short?
-  - Position sizing: $25-$100 based on quality metrics
-  - Commission 0.40% round-trip deducted from all P&L
-v22.0: Directional Z fix, Auto-Monitor, Telegram exit alerts, Pattern Analysis
+Pairs Position Monitor v33.0 (v33 update)
+v33.0: Critical Calibration + Coin Conflict Hard Block + Phantom CSV + Size Fix
+  - TP 0.8→1.5%, trailing 0.5/0.25→1.0/0.5 (phantom-proven)
+  - Coin conflict HARD BLOCK (IP/ORDI LONG + IP/UNI SHORT → BLOCKED)
+  - Position size in manual form + from scanner
+  - Phantom CSV export + 12h tracking (was 24h)
+  - Auto-refresh 60s by default (was 120s, was off)
+  - Cooldown enforced in ALL entry paths (manual + import)
+  - max_hold 6h golden mean (phantom optimum 5-8h)
+  - Trade Journal CSV export
+  - Entry grace 10min (was 15)
+v23.0: Static Z-score, Phantom Tracking, Position Sizing, Commission
+v22.0: Directional Z fix, Auto-Monitor, Telegram exit alerts
 
-Запуск: streamlit run monitor_v23_0.py
+Запуск: streamlit run monitor_v33_0.py
 """
 
 import streamlit as st
@@ -23,20 +29,21 @@ try:
 except ImportError:
     def CFG(section, key=None, default=None):
         _d = {'strategy': {'entry_z': 1.8, 'exit_z': 0.5, 'stop_z_offset': 2.0,
-              'min_stop_z': 4.0, 'max_hold_hours': 3, 'commission_pct': 0.10},
-              'monitor': {'refresh_interval_sec': 120, 'exit_z_target': 0.5,
+              'min_stop_z': 4.0, 'max_hold_hours': 6, 'commission_pct': 0.10},
+              'monitor': {'refresh_interval_sec': 60, 'exit_z_target': 0.5,
               'pnl_stop_pct': -1.2, 'hurst_critical': 0.50, 'hurst_warning': 0.48,
               'hurst_border': 0.45, 'pvalue_warning': 0.10, 'correlation_warning': 0.20,
               'trailing_z_bounce': 0.8, 'time_warning_ratio': 1.0,
               'time_exit_ratio': 1.5, 'time_critical_ratio': 2.0,
               'overshoot_deep_z': 1.0, 'pnl_trailing_threshold': 0.5,
               'pnl_trailing_fraction': 0.4,
-              'auto_exit_enabled': True, 'auto_tp_pct': 0.8, 'auto_sl_pct': -1.2,
-              'auto_exit_z': 0.3, 'auto_exit_z_min_pnl': 0.3,
-              'trailing_enabled': True, 'trailing_activate_pct': 0.5, 'trailing_drawdown_pct': 0.25,
+              'auto_exit_enabled': True, 'auto_tp_pct': 1.5, 'auto_sl_pct': -1.2,
+              'auto_exit_z': 0.3, 'auto_exit_z_min_pnl': 0.5,
+              'trailing_enabled': True, 'trailing_activate_pct': 1.0, 'trailing_drawdown_pct': 0.5,
               'auto_flip_enabled': True, 'pair_cooldown_hours': 4, 'pair_loss_limit_pct': -2.0,
               'coin_loss_warn_pct': -3.0, 'daily_loss_limit_pct': -5.0,
-              'max_positions': 10, 'max_coin_exposure': 4, 'entry_grace_minutes': 15}}
+              'max_positions': 10, 'max_coin_exposure': 4, 'entry_grace_minutes': 10,
+              'phantom_track_hours': 12}}
         if key is None:
             return _d.get(section, {})
         return _d.get(section, {}).get(key, default)
@@ -299,7 +306,7 @@ def check_auto_exit(pos, mon):
         return True, f"AUTO_PNLSTOP: P&L={pnl:+.2f}% ≤ {pnl_stop}%"
 
     # 6. Timeout
-    max_hours = pos.get('max_hold_hours', CFG('strategy', 'max_hold_hours', 3))
+    max_hours = pos.get('max_hold_hours', CFG('strategy', 'max_hold_hours', 6))
     if hours_in > max_hours:
         return True, f"AUTO_TIMEOUT: {hours_in:.1f}ч > {max_hours}ч"
 
@@ -537,6 +544,7 @@ def add_position(coin1, coin2, direction, entry_z, entry_hr,
             st.warning(coin_msg)
 
     # v32: AUTO-FLIP — close conflicting positions
+    # v33: COIN CONFLICT HARD BLOCK — prevent hedging same coin in different pairs
     if CFG('monitor', 'auto_flip_enabled', True):
         coins_new = {coin1, coin2}
         flipped = []
@@ -554,21 +562,43 @@ def add_position(coin1, coin2, direction, entry_z, entry_hr,
                     flipped.append(f"#{pos['id']} {pos['coin1']}/{pos['coin2']} {pos['direction']}")
                 except Exception as ex:
                     st.warning(f"⚠️ Не удалось закрыть #{pos['id']} для flip: {ex}")
-            # Same coin in different pair, opposite direction on that coin → warn
-            elif overlap and pos['direction'] != direction:
-                st.warning(
-                    f"⚠️ КОНФЛИКТ: {', '.join(overlap)} уже в #{pos['id']} "
-                    f"{pos['coin1']}/{pos['coin2']} {pos['direction']}. "
-                    f"Новая: {pair_name} {direction}. Проверьте экспозицию."
-                )
+            # v33: COIN-LEVEL CONFLICT HARD BLOCK
+            # Different pairs with shared coin + opposite direction on that coin → BLOCK
+            elif overlap:
+                for shared_coin in overlap:
+                    # Determine direction of shared coin in EXISTING position
+                    if pos['direction'] == 'LONG':
+                        existing_long_coin = pos['coin1']  # long spread = long coin1
+                    else:
+                        existing_long_coin = pos['coin2']  # short spread = long coin2
+                    
+                    # Determine direction of shared coin in NEW position
+                    if direction == 'LONG':
+                        new_long_coin = coin1
+                    else:
+                        new_long_coin = coin2
+                    
+                    # If same coin is LONG in one and SHORT in other → CONFLICT
+                    existing_is_long = (shared_coin == existing_long_coin)
+                    new_is_long = (shared_coin == new_long_coin)
+                    
+                    if existing_is_long != new_is_long:
+                        st.error(
+                            f"🚫 CONFLICT BLOCK: {shared_coin} "
+                            f"{'LONG' if existing_is_long else 'SHORT'} в "
+                            f"#{pos['id']} {pos['coin1']}/{pos['coin2']} {pos['direction']} + "
+                            f"{'LONG' if new_is_long else 'SHORT'} в новой "
+                            f"{pair_name} {direction} → хедж самого себя! "
+                            f"Нулевая прибыль + двойная комиссия.")
+                        return None  # HARD BLOCK
         if flipped:
             st.info(f"🔄 AUTO-FLIP: закрыты {', '.join(flipped)} → новый {direction} {pair_name}")
             # Reload after closing
             positions = load_positions()
 
-    # v27: defaults from unified config
+    # v33: defaults from unified config (max_hold=6h, pnl_stop=-1.2)
     if max_hold_hours is None:
-        max_hold_hours = CFG('strategy', 'max_hold_hours', 3)
+        max_hold_hours = CFG('strategy', 'max_hold_hours', 6)
     if pnl_stop_pct is None:
         pnl_stop_pct = CFG('monitor', 'pnl_stop_pct', -1.2)
     # v5.0: Adaptive stop_z — at least offset Z-units beyond entry
@@ -626,8 +656,9 @@ def close_position(pos_id, exit_price1, exit_price2, exit_z, reason,
             # v23.0: Commission deduction
             p['pnl_gross_pct'] = round(pnl_gross, 3)
             p['pnl_pct'] = round(pnl_gross - COMMISSION_ROUND_TRIP_PCT, 3)
-            # v23.0: Phantom tracking — monitor 24h post-close
-            p['phantom_track_until'] = (now_msk() + timedelta(hours=24)).isoformat()
+            # v33: Phantom tracking — configurable hours (was hardcoded 24h)
+            _phantom_hours = CFG('monitor', 'phantom_track_hours', 12)
+            p['phantom_track_until'] = (now_msk() + timedelta(hours=_phantom_hours)).isoformat()
             p['phantom_max_pnl'] = p['pnl_pct']
             p['phantom_min_pnl'] = p['pnl_pct']
             p['phantom_last_pnl'] = p['pnl_pct']
@@ -1000,7 +1031,7 @@ def monitor_position(pos, exchange_name):
     # v5.0: Adaptive stop — at least 2.0 Z-units beyond entry, minimum 4.0
     default_stop = max(abs(pos['entry_z']) + 2.0, 4.0)
     sz = pos.get('stop_z', default_stop)
-    max_hours = pos.get('max_hold_hours', CFG('strategy', 'max_hold_hours', 3))
+    max_hours = pos.get('max_hold_hours', CFG('strategy', 'max_hold_hours', 6))
     pnl_stop = pos.get('pnl_stop_pct', CFG('monitor', 'pnl_stop_pct', -1.2))
     
     # v32: Entry grace period — suppress exit signals for first N minutes
@@ -1214,14 +1245,19 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📍 Pairs Position Monitor")
-st.caption("v23.0 | 26.02.2026 | Static Z-Score + Phantom Tracking + Commission + Position Sizing")
+st.caption("v33.0 | Calibrated TP/Trail + Coin Conflict Block + Phantom CSV + Size Fix")
 
 # Sidebar
 with st.sidebar:
     st.header("⚙️ Настройки")
     exchange = st.selectbox("Биржа", ['okx', 'kucoin', 'bybit', 'binance'], index=0,
                            help="⚠️ Binance/Bybit заблокированы на облачных серверах. Используйте OKX/KuCoin.")
-    auto_refresh = st.checkbox("Авто-обновление (2 мин)", value=False)
+    # v33: Auto-refresh ON by default, configurable interval
+    auto_refresh = st.checkbox("🔄 Авто-обновление", value=True)
+    _refresh_sec_cfg = CFG('monitor', 'refresh_interval_sec', 60)
+    refresh_interval_sec = st.slider("⏱ Интервал обновления (сек)", 30, 300, 
+                                      value=_refresh_sec_cfg, step=15,
+                                      help="v33: 60с по умолчанию (было 120с)")
     
     # v30: Telegram exit alerts
     st.markdown("---")
@@ -1364,11 +1400,16 @@ with st.sidebar:
         
         new_notes = st.text_input("Заметки", "")
         
+        # v33: Position size in manual form (was missing → all positions had size=NONE)
+        st.markdown("**💰 Размер позиции**")
+        new_size = st.number_input("Размер ($)", value=100, min_value=25, max_value=500, step=25,
+                                    help="v33: Размер позиции в USDT. Ранее не передавался из ручной формы.")
+        
         # v2.0: Risk management
         st.markdown("**⚠️ Риск-менеджмент**")
         col_r1, col_r2 = st.columns(2)
         with col_r1:
-            new_max_hours = st.number_input("Max часов в позиции", value=int(CFG('strategy', 'max_hold_hours', 3)), step=1)
+            new_max_hours = st.number_input("Max часов в позиции", value=int(CFG('strategy', 'max_hold_hours', 6)), step=1)
         with col_r2:
             new_pnl_stop = st.number_input("P&L Stop (%)", value=float(CFG('monitor', 'pnl_stop_pct', -1.2)), step=0.1)
         
@@ -1402,7 +1443,8 @@ with st.sidebar:
                              new_p1, new_p2, new_tf, new_notes,
                              max_hold_hours=new_max_hours,
                              pnl_stop_pct=new_pnl_stop,
-                             entry_intercept=new_intercept)
+                             entry_intercept=new_intercept,
+                             recommended_size=new_size)
             if pos:
                 st.success(f"✅ Позиция #{pos['id']} добавлена: {new_dir} {new_c1}/{new_c2} | 💰 ${pos.get('recommended_size', 100):.0f}")
                 st.rerun()
@@ -1474,6 +1516,26 @@ with tab1:
                             _auto_reason,
                             exit_z_static=mon.get('z_static'))
                         st.success(f"✅ #{pos['id']} {pair_name} закрыта автоматически | P&L: {mon['pnl_pct']:+.2f}%")
+                        
+                        # v33: Enhanced Telegram alert for auto-close
+                        if (st.session_state.get('tg_enabled') and 
+                            st.session_state.get('tg_alert_exits', True)):
+                            try:
+                                _tg_tok = st.session_state.get('tg_token', '')
+                                _tg_cid = st.session_state.get('tg_chat_id', '')
+                                if _tg_tok and _tg_cid:
+                                    _pnl_emoji = '✅' if mon['pnl_pct'] > 0 else '❌'
+                                    _close_msg = (
+                                        f"{_pnl_emoji} <b>AUTO-CLOSE</b>\n"
+                                        f"#{pos['id']} {pair_name} {pos['direction']}\n"
+                                        f"P&L: {mon['pnl_pct']:+.2f}% | Best: {mon.get('best_pnl', 0):+.2f}%\n"
+                                        f"Reason: {_auto_reason}\n"
+                                        f"Hold: {mon['hours_in']:.1f}ч"
+                                    )
+                                    send_telegram(_tg_tok, _tg_cid, _close_msg)
+                            except Exception:
+                                pass
+                        
                         st.rerun()
                     except Exception as ex:
                         st.error(f"❌ Ошибка авто-закрытия: {ex}")
@@ -1983,8 +2045,9 @@ with tab2:
 # TAB PHANTOM: 👻 Post-close tracking (v23.0)
 # ═══════════════════════════════════════════════════════
 with tab_phantom:
-    st.markdown("### 👻 Phantom Tracking (v23.0)")
-    st.caption("Отслеживание пар 24ч после закрытия — показывает, не вышли ли вы слишком рано")
+    st.markdown("### 👻 Phantom Tracking (v33.0)")
+    _phantom_h = CFG('monitor', 'phantom_track_hours', 12)
+    st.caption(f"Отслеживание пар {_phantom_h}ч после закрытия — показывает, не вышли ли вы слишком рано")
     
     # Find positions with active phantom tracking
     phantom_positions = [p for p in positions 
@@ -2006,8 +2069,65 @@ with tab_phantom:
             expired_phantoms.append(p)
     
     if not phantom_positions:
-        st.info("📭 Нет фантомных позиций. Закройте сделку — монитор будет следить ещё 24ч.")
+        st.info(f"📭 Нет фантомных позиций. Закройте сделку — монитор будет следить ещё {_phantom_h}ч.")
     else:
+        # v33: Phantom CSV export button
+        if active_phantoms or expired_phantoms:
+            phantom_rows = []
+            for ph in active_phantoms + expired_phantoms:
+                exit_pnl = float(ph.get('pnl_pct', 0) or 0)
+                phantom_max = float(ph.get('phantom_max_pnl', exit_pnl) or exit_pnl)
+                phantom_last = float(ph.get('phantom_last_pnl', exit_pnl) or exit_pnl)
+                left_on_table = max(0, phantom_max - exit_pnl)
+                best_during = float(ph.get('best_pnl_during_trade', ph.get('best_pnl', 0)) or 0)
+                
+                # Calculate hours tracked
+                try:
+                    _entry_dt = datetime.fromisoformat(str(ph.get('entry_time', '')))
+                    _exit_dt = datetime.fromisoformat(str(ph.get('exit_time', '')))
+                    _hours_in = (_exit_dt - _entry_dt).total_seconds() / 3600
+                except Exception:
+                    _hours_in = 0
+                
+                phantom_rows.append({
+                    'Pair': f"{ph['coin1']}/{ph['coin2']}",
+                    'Direction': ph['direction'],
+                    'Exit_PnL': round(exit_pnl, 3),
+                    'Best_During': round(best_during, 3),
+                    'Phantom_Max': round(phantom_max, 3),
+                    'Phantom_Last': round(phantom_last, 3),
+                    'Left_On_Table': round(left_on_table, 3),
+                    'Exit_Reason': ph.get('exit_reason', ''),
+                    'Entry_Time': ph.get('entry_time', ''),
+                    'Exit_Time': ph.get('exit_time', ''),
+                    'Hours_In_Trade': round(_hours_in, 1),
+                    'Entry_Z': round(float(ph.get('entry_z', 0) or 0), 2),
+                    'Size_USD': ph.get('recommended_size', 100),
+                })
+            
+            df_phantom = pd.DataFrame(phantom_rows)
+            
+            # Summary metrics
+            if phantom_rows:
+                total_left = sum(r['Left_On_Table'] for r in phantom_rows)
+                avg_left = total_left / len(phantom_rows) if phantom_rows else 0
+                n_cut_short = sum(1 for r in phantom_rows if r['Left_On_Table'] > 0.2)
+                
+                pm1, pm2, pm3, pm4 = st.columns(4)
+                pm1.metric("Всего фантомов", len(phantom_rows))
+                pm2.metric("💸 Упущено всего", f"+{total_left:.2f}%")
+                pm3.metric("Avg упущено", f"+{avg_left:.2f}%")
+                pm4.metric("Рано закрыто", f"{n_cut_short}/{len(phantom_rows)}")
+            
+            csv_data = df_phantom.to_csv(index=False)
+            st.download_button(
+                "📥 Скачать Phantom CSV",
+                csv_data,
+                f"phantom_{now_msk().strftime('%Y%m%d_%H%M')}.csv",
+                "text/csv",
+                key="phantom_csv_btn")
+            
+            st.markdown("---")
         # Update phantom tracking for active phantoms
         for ph in active_phantoms:
             try:
@@ -2381,10 +2501,10 @@ with tab3:
                     pass
 
 # Auto refresh
-# v27: Non-blocking auto-refresh — rerun OUTSIDE try/except
+# v33: Configurable auto-refresh interval (was hardcoded to CFG value)
 _monitor_needs_rerun = False
 if auto_refresh:
-    _mon_wait = CFG('monitor', 'refresh_interval_sec', 120)
+    _mon_wait = refresh_interval_sec  # v33: from slider, not just CFG
     st.info(f"⏱️ Авто-обновление через {_mon_wait}с...")
     time.sleep(_mon_wait)
     _monitor_needs_rerun = True
@@ -2644,17 +2764,82 @@ with tab4:
         
         # === EXPORT ===
         st.markdown("#### 📥 Экспорт")
-        hist_df = pd.DataFrame(history)
-        csv_hist = hist_df.to_csv(index=False)
-        st.download_button("📥 Скачать полную историю (CSV)", csv_hist,
-                          f"trade_history_{now_msk().strftime('%Y%m%d_%H%M')}.csv",
-                          "text/csv", key="hist_export_btn")
+        
+        # v33: Trade Journal CSV (detailed export)
+        if history:
+            journal_rows = []
+            for t in history:
+                t_pnl = float(t.get('pnl_pct', 0) or 0)
+                # Calculate hold hours
+                try:
+                    _et = datetime.fromisoformat(str(t.get('entry_time', '')).replace('+03:00', '+03:00'))
+                    _xt = datetime.fromisoformat(str(t.get('exit_time', '')).replace('+03:00', '+03:00'))
+                    _hold_h = (_xt - _et).total_seconds() / 3600
+                except Exception:
+                    _hold_h = 0
+                
+                journal_rows.append({
+                    'ID': t.get('id', ''),
+                    'Pair': t.get('pair', f"{t.get('coin1','')}/{t.get('coin2','')}"),
+                    'Direction': t.get('direction', ''),
+                    'Entry_Time': t.get('entry_time', ''),
+                    'Exit_Time': t.get('exit_time', ''),
+                    'Hold_Hours': round(_hold_h, 1),
+                    'Entry_Z': round(float(t.get('entry_z', 0) or 0), 2),
+                    'Exit_Z': round(float(t.get('exit_z', 0) or 0), 2),
+                    'Entry_HR': round(float(t.get('entry_hr', 0) or 0), 4),
+                    'PnL_Net': round(t_pnl, 3),
+                    'PnL_Gross': round(float(t.get('pnl_gross_pct', 0) or 0), 3),
+                    'Best_PnL': round(float(t.get('best_pnl_during_trade', t.get('best_pnl', 0)) or 0), 3),
+                    'Phantom_Max': t.get('phantom_max_pnl', ''),
+                    'Exit_Reason': t.get('exit_reason', ''),
+                    'Size_USD': t.get('recommended_size', 100),
+                    'MBT_Verdict': t.get('mbt_verdict', ''),
+                    'Signal_Type': t.get('signal_type', ''),
+                    'Entry_Label': t.get('entry_label', ''),
+                    'Auto_Opened': t.get('auto_opened', False),
+                    'Notes': t.get('notes', ''),
+                })
+            df_journal = pd.DataFrame(journal_rows)
+            
+            jc1, jc2 = st.columns(2)
+            with jc1:
+                st.download_button("📥 Trade Journal (CSV)", 
+                    df_journal.to_csv(index=False),
+                    f"journal_{now_msk().strftime('%Y%m%d')}.csv",
+                    "text/csv", key="journal_export_btn")
+            with jc2:
+                hist_df = pd.DataFrame(history)
+                csv_hist = hist_df.to_csv(index=False)
+                st.download_button("📥 Полная история (RAW CSV)", csv_hist,
+                                  f"trade_history_{now_msk().strftime('%Y%m%d_%H%M')}.csv",
+                                  "text/csv", key="hist_export_btn")
+        
+        # v33: Session Summary (итоги дня)
+        st.markdown("#### 📊 Итоги дня")
+        today = now_msk().strftime('%Y-%m-%d')
+        today_trades = [t for t in history 
+                        if str(t.get('exit_time', '')).startswith(today)]
+        if today_trades:
+            t_pnls = [float(t.get('pnl_pct', 0) or 0) for t in today_trades]
+            t_wins = sum(1 for p in t_pnls if p > 0)
+            t_wr = t_wins / len(t_pnls) * 100 if t_pnls else 0
+            
+            ss1, ss2, ss3, ss4 = st.columns(4)
+            ss1.metric("Сделок сегодня", len(t_pnls))
+            ss2.metric("WR сегодня", f"{t_wr:.0f}%", f"{t_wins}W / {len(t_pnls)-t_wins}L")
+            ss3.metric("Net PnL", f"{sum(t_pnls):+.2f}%")
+            ss4.metric("Avg PnL", f"{np.mean(t_pnls):+.3f}%")
+        else:
+            st.info("Нет закрытых сделок сегодня.")
 
 st.divider()
 st.caption("""
-Как добавить позицию:
+v33.0 — Как добавить позицию:
 1. Найди 🟢 ВХОД в скринере
-2. Скопируй данные: Coin1, Coin2, Direction, Z, HR, цены
-3. Введи в форму слева → "Загрузить цены + Добавить"
-4. Монитор покажет когда закрывать + предупредит если пара потеряла качество
+2. Импортируй через pending или загрузи JSON
+3. Или введи вручную в форму слева (с размером позиции!) → "Загрузить цены + Добавить"
+4. Монитор покажет когда закрывать + авто-TP/SL/Trail
+
+⚡ v33 изменения: TP=1.5% | Trail=1.0/0.5 | Refresh=60с | Max hold=6ч | Coin conflict BLOCK
 """)
