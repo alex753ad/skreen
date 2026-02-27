@@ -1131,104 +1131,103 @@ class CryptoPairsScanner:
                     f"Фаза 2: {idx_c + 1}/{len(candidates)}"
                 )
             
-            fdr_passed = bool(fdr_rejected[pval_idx])
-            pvalue_adj = float(adj_pvalues[pval_idx])
-            
-            # Hurst (DFA)
-            hurst = calculate_hurst_exponent(result['spread'])
-            hurst_is_fallback = (hurst == 0.5)
-            
-            # v16: Hurst EMA smoothing (рассуждение #2)
-            hurst_ema_info = calculate_hurst_ema(result['spread'])
-            hurst_ema = hurst_ema_info.get('hurst_ema', hurst)
-            hurst_stable = hurst_ema_info.get('is_stable', True)
-            
-            # v19.1: Expanding Window Hurst (P3 Roadmap)
-            hurst_exp_info = calculate_hurst_expanding(result['spread'])
-            
-            # OU
-            ou_params = calculate_ou_parameters(result['spread'], dt=dt)
-            ou_score = calculate_ou_score(ou_params, hurst)
-            is_valid, reason = validate_ou_quality(ou_params, hurst)
-            
-            # Stability
-            stability = check_cointegration_stability(
-                price_data[coin1].values, price_data[coin2].values
-            )
-            
-            # v10: количество баров
-            n_bars = len(result['spread']) if result.get('spread') is not None else 0
-            hr_std_val = result.get('hr_std', 0.0)
-            
-            # [v10.1] Sanitizer — жёсткие исключения (с min_bars + HR uncertainty)
-            san_ok, san_reason = sanitize_pair(
-                hedge_ratio=result['hedge_ratio'],
-                stability_passed=stability['windows_passed'],
-                stability_total=stability['total_windows'],
-                zscore=result['zscore'],
-                n_bars=n_bars,
-                hr_std=hr_std_val
-            )
-            if not san_ok:
-                continue
-            
-            # [NEW] ADF-тест спреда
-            adf = adf_test_spread(result['spread'])
-            
-            # [v10] Crossing Density — частота пересечений нуля
-            crossing_d = calculate_crossing_density(
-                result.get('zscore_series', np.array([])),
-                window=min(n_bars, 100)
-            )
-            
-            # [v10.1] Confidence (с HR uncertainty)
-            confidence, conf_checks, conf_total = calculate_confidence(
-                hurst=hurst,
-                stability_score=stability['stability_score'],
-                fdr_passed=fdr_passed,
-                adf_passed=adf['is_stationary'],
-                zscore=result['zscore'],
-                hedge_ratio=result['hedge_ratio'],
-                hurst_is_fallback=hurst_is_fallback,
-                hr_std=hr_std_val
-            )
-            
-            # [v10.1] Quality Score (с HR uncertainty penalty)
-            q_score, q_breakdown = calculate_quality_score(
-                hurst=hurst,
-                ou_params=ou_params,
-                pvalue_adj=pvalue_adj,
-                stability_score=stability['stability_score'],
-                hedge_ratio=result['hedge_ratio'],
-                adf_passed=adf['is_stationary'],
-                hurst_is_fallback=hurst_is_fallback,
-                crossing_density=crossing_d,
-                n_bars=n_bars,
-                hr_std=hr_std_val
-            )
-            
-            # [v8.1] Signal Score (capped by Quality)
-            s_score, s_breakdown = calculate_signal_score(
-                zscore=result['zscore'],
-                ou_params=ou_params,
-                confidence=confidence,
-                quality_score=q_score
-            )
-            
-            # [v8.0] Adaptive Signal — continuous threshold + hurst
-            stab_ratio = stability['stability_score']  # 0.0–1.0
+            # v34: Robust FDR access — prevent "list index out of range"
             try:
-                state, direction, threshold = get_adaptive_signal(
-                    zscore=result['zscore'],
-                    confidence=confidence,
-                    quality_score=q_score,
-                    timeframe=self.timeframe,
-                    stability_ratio=stab_ratio,
-                    fdr_passed=fdr_passed,
-                    hurst=hurst  # v11.0: continuous threshold uses Hurst
+                if pval_idx < len(fdr_rejected):
+                    fdr_passed = bool(fdr_rejected[pval_idx])
+                    pvalue_adj = float(adj_pvalues[pval_idx])
+                else:
+                    fdr_passed = False
+                    pvalue_adj = result['pvalue']
+            except (IndexError, TypeError):
+                fdr_passed = False
+                pvalue_adj = result['pvalue']
+            
+            # v34: Individual pair try/except (prevents >100 coins crash)
+            try:
+                # Hurst (DFA)
+                hurst = calculate_hurst_exponent(result['spread'])
+                hurst_is_fallback = (hurst == 0.5)
+
+                # v16: Hurst EMA smoothing (рассуждение #2)
+                hurst_ema_info = calculate_hurst_ema(result['spread'])
+                hurst_ema = hurst_ema_info.get('hurst_ema', hurst)
+                hurst_stable = hurst_ema_info.get('is_stable', True)
+
+                # v19.1: Expanding Window Hurst (P3 Roadmap)
+                hurst_exp_info = calculate_hurst_expanding(result['spread'])
+
+                # OU
+                ou_params = calculate_ou_parameters(result['spread'], dt=dt)
+                ou_score = calculate_ou_score(ou_params, hurst)
+                is_valid, reason = validate_ou_quality(ou_params, hurst)
+
+                # Stability
+                stability = check_cointegration_stability(
+                    price_data[coin1].values, price_data[coin2].values
                 )
-            except TypeError:
-                # Backward compat — старый модуль без hurst/fdr_passed
+
+                # v10: количество баров
+                n_bars = len(result['spread']) if result.get('spread') is not None else 0
+                hr_std_val = result.get('hr_std', 0.0)
+
+                # [v10.1] Sanitizer — жёсткие исключения (с min_bars + HR uncertainty)
+                san_ok, san_reason = sanitize_pair(
+                    hedge_ratio=result['hedge_ratio'],
+                    stability_passed=stability['windows_passed'],
+                    stability_total=stability['total_windows'],
+                    zscore=result['zscore'],
+                    n_bars=n_bars,
+                    hr_std=hr_std_val
+                )
+                if not san_ok:
+                    continue
+
+                # [NEW] ADF-тест спреда
+                adf = adf_test_spread(result['spread'])
+
+                # [v10] Crossing Density — частота пересечений нуля
+                crossing_d = calculate_crossing_density(
+                    result.get('zscore_series', np.array([])),
+                    window=min(n_bars, 100)
+                )
+
+                # [v10.1] Confidence (с HR uncertainty)
+                confidence, conf_checks, conf_total = calculate_confidence(
+                    hurst=hurst,
+                    stability_score=stability['stability_score'],
+                    fdr_passed=fdr_passed,
+                    adf_passed=adf['is_stationary'],
+                    zscore=result['zscore'],
+                    hedge_ratio=result['hedge_ratio'],
+                    hurst_is_fallback=hurst_is_fallback,
+                    hr_std=hr_std_val
+                )
+
+                # [v10.1] Quality Score (с HR uncertainty penalty)
+                q_score, q_breakdown = calculate_quality_score(
+                    hurst=hurst,
+                    ou_params=ou_params,
+                    pvalue_adj=pvalue_adj,
+                    stability_score=stability['stability_score'],
+                    hedge_ratio=result['hedge_ratio'],
+                    adf_passed=adf['is_stationary'],
+                    hurst_is_fallback=hurst_is_fallback,
+                    crossing_density=crossing_d,
+                    n_bars=n_bars,
+                    hr_std=hr_std_val
+                )
+
+                # [v8.1] Signal Score (capped by Quality)
+                s_score, s_breakdown = calculate_signal_score(
+                    zscore=result['zscore'],
+                    ou_params=ou_params,
+                    confidence=confidence,
+                    quality_score=q_score
+                )
+
+                # [v8.0] Adaptive Signal — continuous threshold + hurst
+                stab_ratio = stability['stability_score']  # 0.0–1.0
                 try:
                     state, direction, threshold = get_adaptive_signal(
                         zscore=result['zscore'],
@@ -1237,261 +1236,276 @@ class CryptoPairsScanner:
                         timeframe=self.timeframe,
                         stability_ratio=stab_ratio,
                         fdr_passed=fdr_passed,
+                        hurst=hurst  # v11.0: continuous threshold uses Hurst
                     )
                 except TypeError:
-                    state, direction, threshold = get_adaptive_signal(
-                        zscore=result['zscore'],
-                        confidence=confidence,
-                        quality_score=q_score,
-                        timeframe=self.timeframe,
-                        stability_ratio=stab_ratio,
-                    )
-            
-            halflife_hours = result['halflife'] * 24
-            hours_per_bar = {'1h': 1, '4h': 4, '1d': 24}.get(self.timeframe, 4)
-            hl_bars = halflife_hours / hours_per_bar if halflife_hours < 9999 else None
-            
-            # v18: GARCH Z-score (variance-adaptive)
-            garch_info = calculate_garch_zscore(
-                result['spread'], halflife_bars=hl_bars)
-            garch_z = garch_info.get('z_garch', 0)
-            garch_divergence = garch_info.get('z_divergence', 0)
-            garch_var_expanding = garch_info.get('variance_expanding', False)
-            
-            # v10: Z-warning
-            z_warning = abs(result['zscore']) > 4.0
-            
-            # v11.2: Regime detection (spread-based ADX)
-            regime_info = detect_spread_regime(result['spread'].values if hasattr(result['spread'], 'values') else result['spread'])
-            
-            # v12.0: CUSUM structural break test (v13: +Z-magnitude)
-            cusum_info = cusum_structural_break(
-                result['spread'].values if hasattr(result['spread'], 'values') else result['spread'],
-                min_tail=min(30, n_bars // 5),
-                zscore=result['zscore']
-            )
-            
-            # v13.0: Johansen test (symmetric cointegration)
-            johansen_info = johansen_test(
-                price_data.get(coin1, pd.Series()).values if hasattr(price_data.get(coin1, pd.Series()), 'values') else np.array([]),
-                price_data.get(coin2, pd.Series()).values if hasattr(price_data.get(coin2, pd.Series()), 'values') else np.array([])
-            )
-            
-            # v11.2: HR magnitude warning
-            hr_warning = check_hr_magnitude(result['hedge_ratio'])
-            
-            # v11.2: Min bars gate
-            bars_warning = check_minimum_bars(n_bars, self.timeframe)
-            
-            # v17: Mini-backtest gate (P1 Roadmap)
-            # v27: Strategy params from unified config
-            _cfg_entry_z = CFG('strategy', 'entry_z', 1.8)
-            _cfg_tp = CFG('strategy', 'take_profit_pct', 1.5)
-            _cfg_sl = CFG('strategy', 'stop_loss_pct', -5.0)
-            _cfg_mbt_bars = CFG('strategy', 'micro_bt_max_bars', 6)
-            _cfg_comm = CFG('strategy', 'commission_pct', 0.10)
-            _cfg_slip = CFG('strategy', 'slippage_pct', 0.05)
-            _cfg_naked = CFG('strategy', 'hr_naked_threshold', 0.15)
-            
-            bt_result = {'verdict': 'SKIP', 'n_trades': 0}
-            try:
-                p1_arr = price_data[coin1].values if hasattr(price_data.get(coin1, pd.Series()), 'values') else np.array([])
-                p2_arr = price_data[coin2].values if hasattr(price_data.get(coin2, pd.Series()), 'values') else np.array([])
-                if len(p1_arr) >= 80 and len(p2_arr) >= 80:
-                    bt_result = mini_backtest(
-                        result['spread'], p1_arr, p2_arr,
-                        result.get('hedge_ratios', np.full(len(result['spread']), result['hedge_ratio'])),
-                        entry_z=max(_cfg_entry_z, threshold),
-                        halflife_bars=hl_bars if hl_bars and hl_bars > 0 else None,
-                        commission_pct=_cfg_comm,
-                        slippage_pct=_cfg_slip,
-                    )
-            except Exception:
+                    # Backward compat — старый модуль без hurst/fdr_passed
+                    try:
+                        state, direction, threshold = get_adaptive_signal(
+                            zscore=result['zscore'],
+                            confidence=confidence,
+                            quality_score=q_score,
+                            timeframe=self.timeframe,
+                            stability_ratio=stab_ratio,
+                            fdr_passed=fdr_passed,
+                        )
+                    except TypeError:
+                        state, direction, threshold = get_adaptive_signal(
+                            zscore=result['zscore'],
+                            confidence=confidence,
+                            quality_score=q_score,
+                            timeframe=self.timeframe,
+                            stability_ratio=stab_ratio,
+                        )
+
+                halflife_hours = result['halflife'] * 24
+                hours_per_bar = {'1h': 1, '4h': 4, '1d': 24}.get(self.timeframe, 4)
+                hl_bars = halflife_hours / hours_per_bar if halflife_hours < 9999 else None
+
+                # v18: GARCH Z-score (variance-adaptive)
+                garch_info = calculate_garch_zscore(
+                    result['spread'], halflife_bars=hl_bars)
+                garch_z = garch_info.get('z_garch', 0)
+                garch_divergence = garch_info.get('z_divergence', 0)
+                garch_var_expanding = garch_info.get('variance_expanding', False)
+
+                # v10: Z-warning
+                z_warning = abs(result['zscore']) > 4.0
+
+                # v11.2: Regime detection (spread-based ADX)
+                regime_info = detect_spread_regime(result['spread'].values if hasattr(result['spread'], 'values') else result['spread'])
+
+                # v12.0: CUSUM structural break test (v13: +Z-magnitude)
+                cusum_info = cusum_structural_break(
+                    result['spread'].values if hasattr(result['spread'], 'values') else result['spread'],
+                    min_tail=min(30, n_bars // 5),
+                    zscore=result['zscore']
+                )
+
+                # v13.0: Johansen test (symmetric cointegration)
+                johansen_info = johansen_test(
+                    price_data.get(coin1, pd.Series()).values if hasattr(price_data.get(coin1, pd.Series()), 'values') else np.array([]),
+                    price_data.get(coin2, pd.Series()).values if hasattr(price_data.get(coin2, pd.Series()), 'values') else np.array([])
+                )
+
+                # v11.2: HR magnitude warning
+                hr_warning = check_hr_magnitude(result['hedge_ratio'])
+
+                # v11.2: Min bars gate
+                bars_warning = check_minimum_bars(n_bars, self.timeframe)
+
+                # v17: Mini-backtest gate (P1 Roadmap)
+                # v27: Strategy params from unified config
+                _cfg_entry_z = CFG('strategy', 'entry_z', 1.8)
+                _cfg_tp = CFG('strategy', 'take_profit_pct', 1.5)
+                _cfg_sl = CFG('strategy', 'stop_loss_pct', -5.0)
+                _cfg_mbt_bars = CFG('strategy', 'micro_bt_max_bars', 6)
+                _cfg_comm = CFG('strategy', 'commission_pct', 0.10)
+                _cfg_slip = CFG('strategy', 'slippage_pct', 0.05)
+                _cfg_naked = CFG('strategy', 'hr_naked_threshold', 0.15)
+
                 bt_result = {'verdict': 'SKIP', 'n_trades': 0}
-            
-            # v19: Walk-Forward Validation (P1 Roadmap)
-            wf_result = {'verdict': 'SKIP', 'folds_passed': 0}
-            try:
-                if len(p1_arr) >= 120 and len(p2_arr) >= 120:
-                    wf_result = walk_forward_validate(
-                        result['spread'], p1_arr, p2_arr,
-                        result.get('hedge_ratios', np.full(len(result['spread']), result['hedge_ratio'])),
-                        entry_z=max(_cfg_entry_z, threshold),
-                        halflife_bars=hl_bars if hl_bars and hl_bars > 0 else None,
-                    )
-            except Exception:
+                try:
+                    p1_arr = price_data[coin1].values if hasattr(price_data.get(coin1, pd.Series()), 'values') else np.array([])
+                    p2_arr = price_data[coin2].values if hasattr(price_data.get(coin2, pd.Series()), 'values') else np.array([])
+                    if len(p1_arr) >= 80 and len(p2_arr) >= 80:
+                        bt_result = mini_backtest(
+                            result['spread'], p1_arr, p2_arr,
+                            result.get('hedge_ratios', np.full(len(result['spread']), result['hedge_ratio'])),
+                            entry_z=max(_cfg_entry_z, threshold),
+                            halflife_bars=hl_bars if hl_bars and hl_bars > 0 else None,
+                            commission_pct=_cfg_comm,
+                            slippage_pct=_cfg_slip,
+                        )
+                except Exception:
+                    bt_result = {'verdict': 'SKIP', 'n_trades': 0}
+
+                # v19: Walk-Forward Validation (P1 Roadmap)
                 wf_result = {'verdict': 'SKIP', 'folds_passed': 0}
-            
-            # v23: R2 Micro-Backtest (1-6 bar horizon)
-            mbt_result = {'verdict': 'SKIP', 'n_trades': 0}
-            try:
-                if len(p1_arr) >= 80 and len(p2_arr) >= 80:
-                    mbt_result = micro_backtest(
-                        result['spread'], p1_arr, p2_arr,
-                        result.get('hedge_ratios', np.full(len(result['spread']), result['hedge_ratio'])),
-                        entry_z=max(_cfg_entry_z, threshold),
-                        max_hold_bars=_cfg_mbt_bars,
-                        take_profit_pct=_cfg_tp,
-                        stop_loss_pct=_cfg_sl,
-                        commission_pct=_cfg_comm,
-                        slippage_pct=_cfg_slip,
-                    )
-            except Exception:
+                try:
+                    if len(p1_arr) >= 120 and len(p2_arr) >= 120:
+                        wf_result = walk_forward_validate(
+                            result['spread'], p1_arr, p2_arr,
+                            result.get('hedge_ratios', np.full(len(result['spread']), result['hedge_ratio'])),
+                            entry_z=max(_cfg_entry_z, threshold),
+                            halflife_bars=hl_bars if hl_bars and hl_bars > 0 else None,
+                        )
+                except Exception:
+                    wf_result = {'verdict': 'SKIP', 'folds_passed': 0}
+
+                # v23: R2 Micro-Backtest (1-6 bar horizon)
                 mbt_result = {'verdict': 'SKIP', 'n_trades': 0}
-            
-            # v19: Combined BT verdict — use worst of mini-BT and WF
-            combined_verdict = bt_result.get('verdict', 'SKIP')
-            if wf_result.get('verdict') == 'FAIL' and combined_verdict != 'FAIL':
-                combined_verdict = 'WARN'  # WF fail downgrades but doesn't hard-block
-            
-            # v24: R4 Z-Velocity analysis
-            zvel_result = {'velocity': 0, 'entry_quality': 'UNKNOWN'}
-            try:
-                zs_series = result.get('zscore_series')
-                if zs_series is not None and len(zs_series) >= 7:
-                    zvel_result = z_velocity_analysis(zs_series, lookback=5)
-            except Exception:
-                pass
-            
-            results.append({
-                'pair': f"{coin1}/{coin2}",
-                'coin1': coin1,
-                'coin2': coin2,
-                'price1_last': float(price_data[coin1].values[-1]) if coin1 in price_data else 0,
-                'price2_last': float(price_data[coin2].values[-1]) if coin2 in price_data else 0,
-                'pvalue': result['pvalue'],
-                'pvalue_adj': pvalue_adj,
-                'fdr_passed': fdr_passed,
-                'zscore': result['zscore'],
-                'zscore_series': result.get('zscore_series'),
-                'hedge_ratio': result['hedge_ratio'],
-                'intercept': result.get('intercept', 0.0),
-                'halflife_days': result['halflife'],
-                'halflife_hours': halflife_hours,
-                'spread': result['spread'],
-                'signal': state,
-                'direction': direction,
-                'threshold': threshold,
-                'hurst': hurst,
-                'hurst_is_fallback': hurst_is_fallback,
-                'theta': ou_params['theta'] if ou_params else 0,
-                'mu': ou_params['mu'] if ou_params else 0,
-                'sigma': ou_params['sigma'] if ou_params else 0,
-                'halflife_ou': ou_params['halflife_ou'] * 24 if ou_params else 999,
-                'ou_score': ou_score,
-                'ou_valid': is_valid,
-                'ou_reason': reason,
-                'stability_score': stability['stability_score'],
-                'stability_passed': stability['windows_passed'],
-                'stability_total': stability['total_windows'],
-                'is_stable': stability['is_stable'],
-                'adf_pvalue': adf['adf_pvalue'],
-                'adf_passed': adf['is_stationary'],
-                'quality_score': q_score,
-                'quality_breakdown': q_breakdown,
-                'signal_score': s_score,
-                'signal_breakdown': s_breakdown,
-                'trade_score': q_score,
-                'trade_breakdown': q_breakdown,
-                'confidence': confidence,
-                'conf_checks': conf_checks,
-                'conf_total': conf_total,
-                # v9: Kalman
-                'use_kalman': result.get('use_kalman', False),
-                'hr_std': result.get('hr_std', 0.0),
-                'hr_series': result.get('hr_series'),
-                # v10: new metrics
-                'n_bars': n_bars,
-                'z_warning': z_warning,
-                'z_window': result.get('z_window', 30),
-                'crossing_density': crossing_d,
-                'correlation': result.get('correlation', 0.0),
-                # v10.1: HR uncertainty ratio
-                'hr_uncertainty': (hr_std_val / result['hedge_ratio']
-                                   if result['hedge_ratio'] > 0 and hr_std_val > 0
-                                   else 0.0),
-                # v22: R1 HR Naked Position Filter — v27: from config
-                'hr_naked': abs(result['hedge_ratio']) < _cfg_naked,
-                'hr_naked_warning': (
-                    f"⚠️ HR={result['hedge_ratio']:.3f} < {_cfg_naked} — почти naked position! "
-                    f"Хедж {abs(result['hedge_ratio'])*100:.0f}%, "
-                    f"фактически направленная ставка."
-                ) if abs(result['hedge_ratio']) < _cfg_naked else '',
-                # v11.2: Regime detection
-                'regime': regime_info.get('regime', 'UNKNOWN'),
-                'regime_adx': regime_info.get('adx', 0),
-                'regime_vr': regime_info.get('variance_ratio', 1.0),
-                'regime_trend_pct': regime_info.get('trend_pct', 0.5),
-                # v12.0: CUSUM structural break
-                'cusum_break': cusum_info.get('has_break', False),
-                'cusum_score': cusum_info.get('cusum_score', 0.0),
-                'cusum_drift': cusum_info.get('tail_drift', 0.0),
-                'cusum_warning': cusum_info.get('warning'),
-                'cusum_risk': cusum_info.get('risk_level', 'LOW'),
-                'cusum_advice': cusum_info.get('position_advice', ''),
-                # v13.0: Johansen test
-                'johansen_coint': johansen_info.get('is_cointegrated', False) if johansen_info else False,
-                'johansen_trace': johansen_info.get('trace_stat', 0) if johansen_info else 0,
-                'johansen_cv': johansen_info.get('trace_cv_5pct', 0) if johansen_info else 0,
-                'johansen_hr': johansen_info.get('hedge_ratio', 0) if johansen_info else 0,
-                # v21: PCA factor exposure (P5)
-                'pca_cluster_c1': -1,
-                'pca_cluster_c2': -1,
-                'pca_same_cluster': False,
-                'pca_market_neutral': 0.0,
-                'pca_net_pc1': 0.0,
-                # v16: Hurst EMA smoothing
-                'hurst_ema': hurst_ema,
-                'hurst_exp_slope': hurst_exp_info.get('hurst_slope', 0),
-                'hurst_exp_assessment': hurst_exp_info.get('assessment', 'N/A'),
-                'hurst_exp_short': hurst_exp_info.get('hurst_short', hurst),
-                'hurst_exp_long': hurst_exp_info.get('hurst_long', hurst),
-                'hurst_mr_strengthening': hurst_exp_info.get('mr_strengthening', False),
-                'hurst_mr_weakening': hurst_exp_info.get('mr_weakening', False),
-                'hurst_raw': hurst,
-                'hurst_std': hurst_ema_info.get('hurst_std', 0),
-                'hurst_stable': hurst_stable,
-                'hurst_series': hurst_ema_info.get('hurst_series', []),
-                # v18: GARCH Z-score
-                'garch_z': garch_z,
-                'garch_divergence': garch_divergence,
-                'garch_var_expanding': garch_var_expanding,
-                'garch_vol_ratio': garch_info.get('vol_ratio', 1.0),
-                # v17: Mini-backtest results
-                'bt_verdict': combined_verdict,
-                'bt_pnl': bt_result.get('total_pnl', 0),
-                'bt_sharpe': bt_result.get('sharpe', 0),
-                'bt_wr': bt_result.get('win_rate', 0),
-                'bt_pf': bt_result.get('pf', 0),
-                'bt_trades': bt_result.get('n_trades', 0),
-                # v23: R2 Micro-Backtest results
-                'mbt_verdict': mbt_result.get('verdict', 'SKIP'),
-                'mbt_pnl': mbt_result.get('avg_pnl', 0),
-                'mbt_wr': mbt_result.get('win_rate', 0),
-                'mbt_quick': mbt_result.get('quick_reversion_rate', 0),
-                'mbt_trades': mbt_result.get('n_trades', 0),
-                'mbt_z_vel': mbt_result.get('avg_z_velocity', 0),
-                'mbt_avg_bars': mbt_result.get('avg_bars_held', 0),
-                'mbt_pf': mbt_result.get('pf', 0),
-                # v24: R4 Z-Velocity
-                'z_velocity': zvel_result.get('velocity', 0),
-                'z_acceleration': zvel_result.get('acceleration', 0),
-                'z_entry_quality': zvel_result.get('entry_quality', 'UNKNOWN'),
-                'z_toward_zero': zvel_result.get('z_toward_zero', False),
-                'z_vel_description': zvel_result.get('description', ''),
-                # v19: Walk-Forward results
-                'wf_verdict': wf_result.get('verdict', 'SKIP'),
-                'wf_oos_pnl': wf_result.get('total_oos_pnl', 0),
-                'wf_folds_passed': wf_result.get('folds_passed', 0),
-                'wf_n_folds': wf_result.get('n_folds', 0),
-                # v11.2: Warnings
-                'hr_warning': hr_warning,
-                'bars_warning': bars_warning,
-                # v27: Funding rate (populated later for SIGNAL pairs)
-                'funding_rate_1': 0.0,
-                'funding_rate_2': 0.0,
-                'funding_net': 0.0,
-            })
+                try:
+                    if len(p1_arr) >= 80 and len(p2_arr) >= 80:
+                        mbt_result = micro_backtest(
+                            result['spread'], p1_arr, p2_arr,
+                            result.get('hedge_ratios', np.full(len(result['spread']), result['hedge_ratio'])),
+                            entry_z=max(_cfg_entry_z, threshold),
+                            max_hold_bars=_cfg_mbt_bars,
+                            take_profit_pct=_cfg_tp,
+                            stop_loss_pct=_cfg_sl,
+                            commission_pct=_cfg_comm,
+                            slippage_pct=_cfg_slip,
+                        )
+                except Exception:
+                    mbt_result = {'verdict': 'SKIP', 'n_trades': 0}
+
+                # v19: Combined BT verdict — use worst of mini-BT and WF
+                combined_verdict = bt_result.get('verdict', 'SKIP')
+                if wf_result.get('verdict') == 'FAIL' and combined_verdict != 'FAIL':
+                    combined_verdict = 'WARN'  # WF fail downgrades but doesn't hard-block
+
+                # v24: R4 Z-Velocity analysis
+                zvel_result = {'velocity': 0, 'entry_quality': 'UNKNOWN'}
+                try:
+                    zs_series = result.get('zscore_series')
+                    if zs_series is not None and len(zs_series) >= 7:
+                        zvel_result = z_velocity_analysis(zs_series, lookback=5)
+                except Exception:
+                    pass
+
+                results.append({
+                    'pair': f"{coin1}/{coin2}",
+                    'coin1': coin1,
+                    'coin2': coin2,
+                    'price1_last': float(price_data[coin1].values[-1]) if coin1 in price_data else 0,
+                    'price2_last': float(price_data[coin2].values[-1]) if coin2 in price_data else 0,
+                    'pvalue': result['pvalue'],
+                    'pvalue_adj': pvalue_adj,
+                    'fdr_passed': fdr_passed,
+                    'zscore': result['zscore'],
+                    'zscore_series': result.get('zscore_series'),
+                    'hedge_ratio': result['hedge_ratio'],
+                    'intercept': result.get('intercept', 0.0),
+                    'halflife_days': result['halflife'],
+                    'halflife_hours': halflife_hours,
+                    'spread': result['spread'],
+                    'signal': state,
+                    'direction': direction,
+                    'threshold': threshold,
+                    'hurst': hurst,
+                    'hurst_is_fallback': hurst_is_fallback,
+                    'theta': ou_params['theta'] if ou_params else 0,
+                    'mu': ou_params['mu'] if ou_params else 0,
+                    'sigma': ou_params['sigma'] if ou_params else 0,
+                    'halflife_ou': ou_params['halflife_ou'] * 24 if ou_params else 999,
+                    'ou_score': ou_score,
+                    'ou_valid': is_valid,
+                    'ou_reason': reason,
+                    'stability_score': stability['stability_score'],
+                    'stability_passed': stability['windows_passed'],
+                    'stability_total': stability['total_windows'],
+                    'is_stable': stability['is_stable'],
+                    'adf_pvalue': adf['adf_pvalue'],
+                    'adf_passed': adf['is_stationary'],
+                    'quality_score': q_score,
+                    'quality_breakdown': q_breakdown,
+                    'signal_score': s_score,
+                    'signal_breakdown': s_breakdown,
+                    'trade_score': q_score,
+                    'trade_breakdown': q_breakdown,
+                    'confidence': confidence,
+                    'conf_checks': conf_checks,
+                    'conf_total': conf_total,
+                    # v9: Kalman
+                    'use_kalman': result.get('use_kalman', False),
+                    'hr_std': result.get('hr_std', 0.0),
+                    'hr_series': result.get('hr_series'),
+                    # v10: new metrics
+                    'n_bars': n_bars,
+                    'z_warning': z_warning,
+                    'z_window': result.get('z_window', 30),
+                    'crossing_density': crossing_d,
+                    'correlation': result.get('correlation', 0.0),
+                    # v10.1: HR uncertainty ratio
+                    'hr_uncertainty': (hr_std_val / result['hedge_ratio']
+                                       if result['hedge_ratio'] > 0 and hr_std_val > 0
+                                       else 0.0),
+                    # v22: R1 HR Naked Position Filter — v27: from config
+                    'hr_naked': abs(result['hedge_ratio']) < _cfg_naked,
+                    'hr_naked_warning': (
+                        f"⚠️ HR={result['hedge_ratio']:.3f} < {_cfg_naked} — почти naked position! "
+                        f"Хедж {abs(result['hedge_ratio'])*100:.0f}%, "
+                        f"фактически направленная ставка."
+                    ) if abs(result['hedge_ratio']) < _cfg_naked else '',
+                    # v11.2: Regime detection
+                    'regime': regime_info.get('regime', 'UNKNOWN'),
+                    'regime_adx': regime_info.get('adx', 0),
+                    'regime_vr': regime_info.get('variance_ratio', 1.0),
+                    'regime_trend_pct': regime_info.get('trend_pct', 0.5),
+                    # v12.0: CUSUM structural break
+                    'cusum_break': cusum_info.get('has_break', False),
+                    'cusum_score': cusum_info.get('cusum_score', 0.0),
+                    'cusum_drift': cusum_info.get('tail_drift', 0.0),
+                    'cusum_warning': cusum_info.get('warning'),
+                    'cusum_risk': cusum_info.get('risk_level', 'LOW'),
+                    'cusum_advice': cusum_info.get('position_advice', ''),
+                    # v13.0: Johansen test
+                    'johansen_coint': johansen_info.get('is_cointegrated', False) if johansen_info else False,
+                    'johansen_trace': johansen_info.get('trace_stat', 0) if johansen_info else 0,
+                    'johansen_cv': johansen_info.get('trace_cv_5pct', 0) if johansen_info else 0,
+                    'johansen_hr': johansen_info.get('hedge_ratio', 0) if johansen_info else 0,
+                    # v21: PCA factor exposure (P5)
+                    'pca_cluster_c1': -1,
+                    'pca_cluster_c2': -1,
+                    'pca_same_cluster': False,
+                    'pca_market_neutral': 0.0,
+                    'pca_net_pc1': 0.0,
+                    # v16: Hurst EMA smoothing
+                    'hurst_ema': hurst_ema,
+                    'hurst_exp_slope': hurst_exp_info.get('hurst_slope', 0),
+                    'hurst_exp_assessment': hurst_exp_info.get('assessment', 'N/A'),
+                    'hurst_exp_short': hurst_exp_info.get('hurst_short', hurst),
+                    'hurst_exp_long': hurst_exp_info.get('hurst_long', hurst),
+                    'hurst_mr_strengthening': hurst_exp_info.get('mr_strengthening', False),
+                    'hurst_mr_weakening': hurst_exp_info.get('mr_weakening', False),
+                    'hurst_raw': hurst,
+                    'hurst_std': hurst_ema_info.get('hurst_std', 0),
+                    'hurst_stable': hurst_stable,
+                    'hurst_series': hurst_ema_info.get('hurst_series', []),
+                    # v18: GARCH Z-score
+                    'garch_z': garch_z,
+                    'garch_divergence': garch_divergence,
+                    'garch_var_expanding': garch_var_expanding,
+                    'garch_vol_ratio': garch_info.get('vol_ratio', 1.0),
+                    # v17: Mini-backtest results
+                    'bt_verdict': combined_verdict,
+                    'bt_pnl': bt_result.get('total_pnl', 0),
+                    'bt_sharpe': bt_result.get('sharpe', 0),
+                    'bt_wr': bt_result.get('win_rate', 0),
+                    'bt_pf': bt_result.get('pf', 0),
+                    'bt_trades': bt_result.get('n_trades', 0),
+                    # v23: R2 Micro-Backtest results
+                    'mbt_verdict': mbt_result.get('verdict', 'SKIP'),
+                    'mbt_pnl': mbt_result.get('avg_pnl', 0),
+                    'mbt_wr': mbt_result.get('win_rate', 0),
+                    'mbt_quick': mbt_result.get('quick_reversion_rate', 0),
+                    'mbt_trades': mbt_result.get('n_trades', 0),
+                    'mbt_z_vel': mbt_result.get('avg_z_velocity', 0),
+                    'mbt_avg_bars': mbt_result.get('avg_bars_held', 0),
+                    'mbt_pf': mbt_result.get('pf', 0),
+                    # v24: R4 Z-Velocity
+                    'z_velocity': zvel_result.get('velocity', 0),
+                    'z_acceleration': zvel_result.get('acceleration', 0),
+                    'z_entry_quality': zvel_result.get('entry_quality', 'UNKNOWN'),
+                    'z_toward_zero': zvel_result.get('z_toward_zero', False),
+                    'z_vel_description': zvel_result.get('description', ''),
+                    # v19: Walk-Forward results
+                    'wf_verdict': wf_result.get('verdict', 'SKIP'),
+                    'wf_oos_pnl': wf_result.get('total_oos_pnl', 0),
+                    'wf_folds_passed': wf_result.get('folds_passed', 0),
+                    'wf_n_folds': wf_result.get('n_folds', 0),
+                    # v11.2: Warnings
+                    'hr_warning': hr_warning,
+                    'bars_warning': bars_warning,
+                    # v27: Funding rate (populated later for SIGNAL pairs)
+                    'funding_rate_1': 0.0,
+                    'funding_rate_2': 0.0,
+                    'funding_net': 0.0,
+                })
+            except Exception as _pair_err:
+                # v34: Skip broken pair, don't kill entire scan
+                continue
         
         # Сортируем: v6.0 — сначала по entry readiness, потом по Signal, потом по Quality
         signal_order = {'SIGNAL': 0, 'READY': 1, 'WATCH': 2, 'NEUTRAL': 3}
@@ -1713,7 +1727,7 @@ def plot_spread_chart(spread_data, pair_name, zscore, threshold=2.0, direction='
 # === ИНТЕРФЕЙС ===
 
 st.markdown('<p class="main-header">🔍 Crypto Pairs Trading Scanner</p>', unsafe_allow_html=True)
-st.caption("Версия 31.0 | 26.02.2026 | Rally Filter + Position Sizing + Intercept display")
+st.caption("Версия 34.0 | 27.02.2026 | v34: BT Hard Filter + Adaptive TP + Z→Trail + Bug fixes")
 
 # v27: Config info panel
 try:
@@ -2332,6 +2346,22 @@ if _do_scan:
                             continue
                         if p.get('direction', 'NONE') == 'NONE':
                             continue
+                        # v34: Hard BT filter — block ❌BT from auto-entry
+                        _bt_mode = CFG('strategy', 'bt_filter_mode', 'HARD')
+                        if _bt_mode == 'HARD' and p.get('bt_verdict') == 'FAIL':
+                            continue
+                        # v34: Max coin positions check
+                        _max_coin_pos = CFG('monitor', 'max_coin_positions', 2)
+                        _skip_coin = False
+                        for _chk_coin in [p['coin1'], p['coin2']]:
+                            _coin_cnt = sum(1 for _op in _existing
+                                          if _op.get('status') == 'OPEN'
+                                          and _chk_coin in (_op.get('coin1',''), _op.get('coin2','')))
+                            if _coin_cnt >= _max_coin_pos:
+                                _skip_coin = True
+                                break
+                        if _skip_coin:
+                            continue
                         _pair_name = p['pair']
                         if _pair_name in _open_pairs:
                             continue
@@ -2374,13 +2404,20 @@ if _do_scan:
                                      f"{_ml_str}"),
                             'exit_z_target': CFG('monitor', 'exit_z_target', 0.5),
                             'stop_z': _adaptive_stop,
-                            'max_hold_hours': CFG('strategy', 'max_hold_hours', 72),
-                            'pnl_stop_pct': CFG('monitor', 'pnl_stop_pct', -5.0),
+                            'max_hold_hours': CFG('strategy', 'max_hold_hours', 6),
+                            'pnl_stop_pct': CFG('monitor', 'pnl_stop_pct', -1.2),
                             # v30: Auto-open metadata
                             'auto_opened': True,
                             'signal_type': p.get('signal', ''),
                             'entry_label': p.get('_entry_label', ''),
                             'ml_grade': _ml_str,
+                            # v34: BT metrics from scanner
+                            'bt_verdict': p.get('bt_verdict', ''),
+                            'bt_pnl': p.get('bt_pnl', 0),
+                            'mu_bt_wr': p.get('mbt_wr', 0),
+                            'v_quality': p.get('z_entry_quality', ''),
+                            '_z_trail_activated': False,
+                            '_z_trail_peak': 0.0,
                         }
                         _existing.append(_new_pos)
                         _open_pairs.add(_pair_name)
@@ -2394,7 +2431,11 @@ if _do_scan:
                     st.toast(f"⚠️ Auto-monitor: {_ae}", icon="⚠️")
             
     except Exception as e:
+        import traceback
+        _tb = traceback.format_exc()
         st.error(f"❌ Ошибка: {e}")
+        with st.expander("🔍 Детали ошибки", expanded=False):
+            st.code(_tb)
         st.info("💡 Попробуйте: уменьшить количество монет, изменить таймфрейм или выбрать другую биржу")
         st.session_state.running = False
 
@@ -4019,7 +4060,7 @@ if auto_refresh and st.session_state.pairs_data is not None:
 # st.rerun() MUST be at top level (not inside try/except!)
 if _needs_rerun:
     st.rerun()
-# VERSION: 7.1
+# VERSION: 7.2 (v34 update)
 # LAST UPDATED: 2026-02-19
 # FIXES v7.1:
 #   [FIX] Smart exchange fallback: Binance→OKX→KuCoin→Bybit (Binance/Bybit 403 on HuggingFace/cloud)

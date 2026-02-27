@@ -1,6 +1,10 @@
 """
-config_loader.py — Единый конфиг для всех приложений v27.
+config_loader.py — Единый конфиг для всех приложений v34.
 Загружает config.yaml, даёт дефолты если файл отсутствует.
+
+v34: Z-exit→TRAIL mode, BT hard filter, adaptive TP, trail 1.2/0.6,
+     max_coin_positions=2, cooldown_after_sl, pair_memory blocking,
+     pass_bt_metrics from scanner to monitor.
 
 Использование:
     from config_loader import CFG
@@ -15,23 +19,41 @@ import os
 
 _DEFAULTS = {
     'strategy': {
-        'entry_z': 1.8, 'exit_z': 0.8, 'stop_z_offset': 2.0, 'min_stop_z': 4.0,
-        'take_profit_pct': 1.5, 'stop_loss_pct': -5.0, 'max_hold_hours': 72,
+        'entry_z': 1.8, 'exit_z': 0.5, 'stop_z_offset': 2.0, 'min_stop_z': 4.0,
+        'take_profit_pct': 1.5, 'stop_loss_pct': -5.0, 'max_hold_hours': 6,
         'micro_bt_max_bars': 6, 'min_hurst': 0.45, 'warn_hurst': 0.48,
         'min_correlation': 0.20, 'hr_naked_threshold': 0.15, 'max_pvalue': 0.15,
         'commission_pct': 0.10, 'slippage_pct': 0.05,
+        # v34 new
+        'bt_filter_mode': 'HARD',  # HARD = ❌BT blocks auto-entry
+        'adaptive_tp': True,
     },
     'scanner': {
         'coins_limit': 100, 'timeframe': '4h', 'lookback_days': 50,
         'exchange': 'okx', 'refresh_interval_min': 10,
+        'pass_bt_metrics': True, 'max_same_coin_signals': 3,
     },
     'monitor': {
-        'refresh_interval_sec': 120, 'exit_z_target': 0.5, 'pnl_stop_pct': -5.0,
+        'refresh_interval_sec': 60, 'exit_z_target': 0.5, 'pnl_stop_pct': -1.2,
         'trailing_z_bounce': 0.8, 'time_warning_ratio': 1.0, 'time_exit_ratio': 1.5,
         'time_critical_ratio': 2.0, 'overshoot_deep_z': 1.0,
         'pnl_trailing_threshold': 0.5, 'pnl_trailing_fraction': 0.4,
         'hurst_critical': 0.50, 'hurst_warning': 0.48, 'hurst_border': 0.45,
         'pvalue_warning': 0.10, 'correlation_warning': 0.20,
+        # v34: auto-exit — Z→TRAIL mode
+        'auto_exit_enabled': True, 'auto_tp_pct': 1.5, 'auto_sl_pct': -1.2,
+        'auto_exit_z': 0.3, 'auto_exit_z_min_pnl': 0.5,
+        'auto_exit_z_mode': 'TRAIL',  # v34: Z→0 activates trail, not close
+        # v34: trailing — widened (phantom-proven)
+        'trailing_enabled': True, 'trailing_activate_pct': 1.2, 'trailing_drawdown_pct': 0.6,
+        'auto_flip_enabled': True, 'pair_cooldown_hours': 4,
+        'pair_loss_limit_pct': -2.0, 'coin_loss_warn_pct': -3.0,
+        'daily_loss_limit_pct': -5.0,
+        'cooldown_after_sl_hours': 4,  # v34: longer cooldown after SL
+        'max_positions': 10, 'max_coin_exposure': 4,
+        'max_coin_positions': 2,  # v34: max 2 positions with same coin
+        'entry_grace_minutes': 10,
+        'phantom_track_hours': 12,
     },
     'backtester': {
         'n_bars': 300, 'max_bars': 50, 'min_bars': 2,
@@ -39,6 +61,9 @@ _DEFAULTS = {
     },
     'z_velocity': {
         'lookback': 5, 'excellent_min_vel': 0.1, 'decel_threshold': 0.05,
+    },
+    'rally_filter': {
+        'warning_z': 2.0, 'block_z': 2.5, 'exit_z': 0.0, 'cooldown_bars': 2,
     },
 }
 
@@ -56,10 +81,15 @@ def _load():
     for section, vals in _DEFAULTS.items():
         _config_data[section] = dict(vals)
     
-    # Try to load config.yaml
+    # Try to load config.yaml (also try streamlit/local variants)
+    _dir = os.path.dirname(os.path.abspath(__file__))
     paths = [
         'config.yaml',
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.yaml'),
+        'config_streamlit.yaml',
+        'config_local.yaml',
+        os.path.join(_dir, 'config.yaml'),
+        os.path.join(_dir, 'config_streamlit.yaml'),
+        os.path.join(_dir, 'config_local.yaml'),
     ]
     for path in paths:
         if os.path.exists(path):
@@ -220,6 +250,42 @@ def pair_memory_summary(pair):
     return (f"📝 {p['trades']} сделок, WR={wr:.0f}%, "
             f"avg={avg:+.2f}%, total={p['total_pnl']:+.2f}%, "
             f"hold={p['avg_hold']:.0f}ч")
+
+
+def pair_memory_is_blocked(pair):
+    """v34: Check if pair should be blocked based on trade history.
+    Returns (blocked: bool, reason: str)."""
+    p = pair_memory_get(pair)
+    if not p or p.get('trades', 0) < 2:
+        return False, ""
+    # Block pair with 0 wins after 2+ trades
+    if p.get('wins', 0) == 0 and p.get('trades', 0) >= 2:
+        return True, (f"🚫 PAIR MEMORY BLOCK: {pair} — "
+                      f"{p['trades']} сделок, 0 побед, "
+                      f"total={p['total_pnl']:+.2f}%")
+    # Block pair with heavy cumulative loss
+    if p.get('total_pnl', 0) < -5.0 and p.get('trades', 0) >= 3:
+        wr = p['wins'] / p['trades'] * 100
+        return True, (f"🚫 PAIR MEMORY BLOCK: {pair} — "
+                      f"total={p['total_pnl']:+.2f}%, WR={wr:.0f}% "
+                      f"за {p['trades']} сделок")
+    return False, ""
+
+
+def adaptive_tp_value(entry_z):
+    """v34: Calculate adaptive TP based on entry Z-score magnitude.
+    Higher |Z| = more room for reversion = higher TP target."""
+    if not CFG('strategy', 'adaptive_tp', True):
+        return CFG('monitor', 'auto_tp_pct', 1.5)
+    az = abs(entry_z)
+    if az > 3.0:
+        return 2.0
+    elif az > 2.0:
+        return 1.5
+    elif az > 1.5:
+        return 1.2
+    else:
+        return 1.0
 
 
 # ═══════════════════════════════════════════════════════

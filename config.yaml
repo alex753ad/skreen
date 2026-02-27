@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════
-# ЕДИНЫЙ КОНФИГ — Mean Reversion Pairs Trading System v33
+# ЕДИНЫЙ КОНФИГ — Mean Reversion Pairs Trading System v34
 # ═══════════════════════════════════════════════════════════════
 # STREAMLIT CLOUD версия
 # Все приложения (scanner, monitor, backtester, analysis)
@@ -15,7 +15,7 @@ strategy:
   min_stop_z: 4.0
   take_profit_pct: 1.5
   stop_loss_pct: -5.0
-  max_hold_hours: 6           # v33: было 3 → 6ч золотая середина (phantom показал оптимум 5-8ч)
+  max_hold_hours: 6
   micro_bt_max_bars: 6
   min_hurst: 0.45
   warn_hurst: 0.48
@@ -24,6 +24,10 @@ strategy:
   max_pvalue: 0.15
   commission_pct: 0.10
   slippage_pct: 0.05
+  # v34: BT filter — HARD = ❌BT блокирует авто-вход, SOFT = только предупреждение
+  bt_filter_mode: "HARD"
+  # v34: Adaptive TP based on entry Z
+  adaptive_tp: true
 
 # --- СКАНЕР ---
 scanner:
@@ -32,10 +36,14 @@ scanner:
   lookback_days: 50
   exchange: "okx"
   refresh_interval_min: 10
+  # v34: передавать BT-метрики в монитор
+  pass_bt_metrics: true
+  # v34: max сигналов с одной монетой
+  max_same_coin_signals: 3
 
 # --- МОНИТОР ---
 monitor:
-  refresh_interval_sec: 60    # v33: было 120 → 60с (ZEC/OKB SL проскочил за 2мин)
+  refresh_interval_sec: 60
   exit_z_target: 0.5
   pnl_stop_pct: -1.2
   trailing_z_bounce: 0.8
@@ -51,32 +59,35 @@ monitor:
   pvalue_warning: 0.10
   correlation_warning: 0.20
 
-  # --- AUTO-EXIT --- v33: КРИТИЧЕСКАЯ КАЛИБРОВКА
+  # --- AUTO-EXIT --- v34: Z-exit → TRAIL mode
   auto_exit_enabled: true
-  auto_tp_pct: 1.5            # v33: было 0.8 → phantom доказал: все 9 wins > 1.5%
-  auto_sl_pct: -1.2           # оставить — работает
-  auto_exit_z: 0.3            # оставить — хороший порог
-  auto_exit_z_min_pnl: 0.5    # v33: было 0.3 → не закрывать мелкую прибыль при Z→0
+  auto_tp_pct: 1.5
+  auto_sl_pct: -1.2
+  auto_exit_z: 0.3
+  auto_exit_z_min_pnl: 0.5
+  auto_exit_z_mode: "TRAIL"
 
-  # --- TRAILING --- v33: КЛЮЧЕВОЕ ИЗМЕНЕНИЕ
+  # --- TRAILING --- v34: расширенные пороги (phantom-доказано)
   trailing_enabled: true
-  trailing_activate_pct: 1.0   # v33: было 0.5 → IP/UNI trail закрыл +0.08% вместо +4.30%
-  trailing_drawdown_pct: 0.5   # v33: было 0.25 → NEAR/FIL trail закрыл +0.31% вместо +1.62%
+  trailing_activate_pct: 1.2
+  trailing_drawdown_pct: 0.6
 
   # --- CONFLICT & COOLDOWN ---
   auto_flip_enabled: true
-  pair_cooldown_hours: 4       # оставить
-  pair_loss_limit_pct: -2.0    # оставить
+  pair_cooldown_hours: 4
+  pair_loss_limit_pct: -2.0
   coin_loss_warn_pct: -3.0
   daily_loss_limit_pct: -5.0
+  cooldown_after_sl_hours: 4
 
   # --- LIMITS ---
   max_positions: 10
   max_coin_exposure: 4
-  entry_grace_minutes: 10      # v33: было 15 → для скальпа достаточно
+  max_coin_positions: 2
+  entry_grace_minutes: 10
 
-  # --- PHANTOM --- v33
-  phantom_track_hours: 12      # v33: было 24 → достаточно для скальпа
+  # --- PHANTOM ---
+  phantom_track_hours: 12
 
 # --- БЭКТЕСТЕР ---
 backtester:
