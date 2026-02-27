@@ -1,19 +1,19 @@
 """
-Pairs Position Monitor v33.0 (v33 update)
+Pairs Position Monitor v34.0 (Combined v33.1+v34 update)
+v34.0: Critical improvements based on 26-27.02 trading analysis:
+  - Z-exit → TRAIL mode (Z→0 activates trailing, NOT close position)
+  - Hard BT filter (❌BT = block auto-entry)
+  - Trailing widened: activate 1.2%, drawdown 0.6% (phantom-proven)
+  - Adaptive TP based on |entry_z| (higher Z = higher TP target)
+  - Max 2 positions per coin (prevent UNI-like concentration)
+  - Live config read (params not frozen at entry time)
+  - Pair memory blocking (0 wins after 2+ trades = blocked)
+  - Cooldown 4h after SL (prevents ZEC/OKB double-loss)
+  - BT metrics passed from scanner (bt_pnl, mu_bt_wr, v_quality)
+  - Position-level trailing state tracking
 v33.0: Critical Calibration + Coin Conflict Hard Block + Phantom CSV + Size Fix
-  - TP 0.8→1.5%, trailing 0.5/0.25→1.0/0.5 (phantom-proven)
-  - Coin conflict HARD BLOCK (IP/ORDI LONG + IP/UNI SHORT → BLOCKED)
-  - Position size in manual form + from scanner
-  - Phantom CSV export + 12h tracking (was 24h)
-  - Auto-refresh 60s by default (was 120s, was off)
-  - Cooldown enforced in ALL entry paths (manual + import)
-  - max_hold 6h golden mean (phantom optimum 5-8h)
-  - Trade Journal CSV export
-  - Entry grace 10min (was 15)
-v23.0: Static Z-score, Phantom Tracking, Position Sizing, Commission
-v22.0: Directional Z fix, Auto-Monitor, Telegram exit alerts
 
-Запуск: streamlit run monitor_v33_0.py
+Запуск: streamlit run monitor_v34_0.py
 """
 
 import streamlit as st
@@ -195,23 +195,28 @@ def _save_cooldowns(data):
     with open(COOLDOWN_FILE, 'w') as f:
         json.dump(data, f, indent=2, default=str)
 
-def record_trade_for_cooldown(pair_name, pnl_pct, direction):
-    """Record closed trade for cooldown tracking."""
+def record_trade_for_cooldown(pair_name, pnl_pct, direction, exit_reason=""):
+    """Record closed trade for cooldown tracking. v34: SL-specific cooldown."""
     cd = _load_cooldowns()
     today = now_msk().strftime('%Y-%m-%d')
     if pair_name not in cd:
-        cd[pair_name] = {'session_pnl': 0, 'last_loss_time': None, 'last_dir': None, 'date': today}
+        cd[pair_name] = {'session_pnl': 0, 'last_loss_time': None, 'last_dir': None,
+                         'date': today, 'sl_exit': False}
     # Reset if new day
     if cd[pair_name].get('date') != today:
-        cd[pair_name] = {'session_pnl': 0, 'last_loss_time': None, 'last_dir': None, 'date': today}
+        cd[pair_name] = {'session_pnl': 0, 'last_loss_time': None, 'last_dir': None,
+                         'date': today, 'sl_exit': False}
     cd[pair_name]['session_pnl'] = round(cd[pair_name].get('session_pnl', 0) + pnl_pct, 3)
     if pnl_pct < 0:
         cd[pair_name]['last_loss_time'] = now_msk().isoformat()
+        # v34: mark SL exit for extended cooldown
+        cd[pair_name]['sl_exit'] = 'AUTO_SL' in str(exit_reason)
     cd[pair_name]['last_dir'] = direction
     _save_cooldowns(cd)
 
 def check_pair_cooldown(pair_name):
-    """Check if pair is in cooldown. Returns (blocked, reason)."""
+    """Check if pair is in cooldown. Returns (blocked, reason).
+    v34: SL exits get longer cooldown (cooldown_after_sl_hours)."""
     cd = _load_cooldowns()
     today = now_msk().strftime('%Y-%m-%d')
     entry = cd.get(pair_name, {})
@@ -221,15 +226,20 @@ def check_pair_cooldown(pair_name):
     pair_limit = CFG('monitor', 'pair_loss_limit_pct', -2.0)
     if entry.get('session_pnl', 0) <= pair_limit:
         return True, f"🚫 {pair_name}: потери {entry['session_pnl']:+.2f}% за сессию (лимит {pair_limit}%)"
-    # 2. Cooldown after loss
+    # 2. Cooldown after loss — v34: SL gets longer cooldown
     if entry.get('last_loss_time'):
         try:
             loss_dt = datetime.fromisoformat(entry['last_loss_time'])
             hours_since = (now_msk() - loss_dt).total_seconds() / 3600
-            cooldown_h = CFG('monitor', 'pair_cooldown_hours', 4)
+            # v34: SL exit → extended cooldown
+            if entry.get('sl_exit', False):
+                cooldown_h = CFG('monitor', 'cooldown_after_sl_hours', 4)
+            else:
+                cooldown_h = CFG('monitor', 'pair_cooldown_hours', 4)
             if hours_since < cooldown_h:
                 remaining = cooldown_h - hours_since
-                return True, f"⏳ {pair_name}: cooldown {remaining:.1f}ч (убыток в {loss_dt.strftime('%H:%M')})"
+                sl_tag = " (SL)" if entry.get('sl_exit') else ""
+                return True, f"⏳ {pair_name}: cooldown{sl_tag} {remaining:.1f}ч (убыток в {loss_dt.strftime('%H:%M')})"
         except Exception:
             pass
     return False, ""
@@ -263,7 +273,14 @@ def check_coin_losses(coin):
 # v32: AUTO-EXIT ENGINE
 # ═══════════════════════════════════════════════════════
 def check_auto_exit(pos, mon):
-    """Check if position should be auto-closed. Returns (should_close, reason) or (False, None)."""
+    """v34: Check if position should be auto-closed. Returns (should_close, reason) or (False, None).
+    
+    v34 KEY CHANGES:
+    - Z-exit → TRAIL mode: Z→0 activates trailing, doesn't close
+    - Adaptive TP: higher |entry_z| → higher TP target
+    - Live config read: uses current config, not frozen params
+    - Trailing state tracked per-position ('trail_activated' flag)
+    """
     if not CFG('monitor', 'auto_exit_enabled', True):
         return False, None
 
@@ -273,40 +290,70 @@ def check_auto_exit(pos, mon):
     hours_in = mon.get('hours_in', 0)
 
     # 0. Entry grace period — suppress exit signals
-    grace_min = CFG('monitor', 'entry_grace_minutes', 15)
+    grace_min = CFG('monitor', 'entry_grace_minutes', 10)
     if hours_in < grace_min / 60:
         return False, None
 
-    # 1. Stop Loss (highest priority)
+    # 1. Stop Loss (highest priority) — LIVE config read
     sl = CFG('monitor', 'auto_sl_pct', -1.2)
     if pnl <= sl:
         return True, f"AUTO_SL: P&L={pnl:+.2f}% ≤ {sl}%"
 
-    # 2. Take Profit
-    tp = CFG('monitor', 'auto_tp_pct', 0.8)
+    # 2. Take Profit — v34: adaptive based on entry_z
+    entry_z = pos.get('entry_z', 0)
+    try:
+        from config_loader import adaptive_tp_value
+        tp = adaptive_tp_value(entry_z)
+    except ImportError:
+        tp = CFG('monitor', 'auto_tp_pct', 1.5)
     if pnl >= tp:
-        return True, f"AUTO_TP: P&L={pnl:+.2f}% ≥ {tp}%"
+        return True, f"AUTO_TP: P&L={pnl:+.2f}% ≥ {tp}% (|Z_entry|={abs(entry_z):.1f})"
 
-    # 3. Z-based exit (Z near zero AND profitable)
+    # 3. Z-based exit — v34: TRAIL mode or CLOSE mode
     z_exit_thresh = CFG('monitor', 'auto_exit_z', 0.3)
-    z_min_pnl = CFG('monitor', 'auto_exit_z_min_pnl', 0.3)
-    if abs(z_static) <= z_exit_thresh and pnl >= z_min_pnl:
-        return True, f"AUTO_Z: |Z|={abs(z_static):.2f} ≤ {z_exit_thresh}, P&L={pnl:+.2f}%"
+    z_min_pnl = CFG('monitor', 'auto_exit_z_min_pnl', 0.5)
+    z_mode = CFG('monitor', 'auto_exit_z_mode', 'TRAIL')
 
-    # 4. Trailing Stop
+    if abs(z_static) <= z_exit_thresh and pnl >= z_min_pnl:
+        if z_mode == 'TRAIL':
+            # v34: Don't close — activate trailing stop from current PnL
+            # Mark position as trail-activated (handled by caller)
+            pos['_z_trail_activated'] = True
+            pos['_z_trail_peak'] = max(best_pnl, pnl)
+            # Don't return True — let trailing handle it below
+        else:
+            # Legacy CLOSE mode
+            return True, f"AUTO_Z: |Z|={abs(z_static):.2f} ≤ {z_exit_thresh}, P&L={pnl:+.2f}%"
+
+    # 4. Trailing Stop — v34: live config + Z-trail activation
     if CFG('monitor', 'trailing_enabled', True):
-        trail_act = CFG('monitor', 'trailing_activate_pct', 0.5)
-        trail_dd = CFG('monitor', 'trailing_drawdown_pct', 0.25)
+        trail_act = CFG('monitor', 'trailing_activate_pct', 1.2)
+        trail_dd = CFG('monitor', 'trailing_drawdown_pct', 0.6)
+        
+        # v34: Z-trail has lower activation threshold
+        z_trail_active = pos.get('_z_trail_activated', False)
+        
+        if z_trail_active:
+            # Z reached zero → use tighter trail from current level
+            z_peak = pos.get('_z_trail_peak', best_pnl)
+            actual_peak = max(z_peak, best_pnl)
+            if pnl > 0 and (actual_peak - pnl) >= trail_dd:
+                return True, (f"AUTO_Z_TRAIL: Z→0 trail, "
+                             f"peak={actual_peak:+.2f}%, now={pnl:+.2f}%, "
+                             f"drop={actual_peak-pnl:.2f}%")
+        
+        # Standard trailing (high-water mark)
         if best_pnl >= trail_act and (best_pnl - pnl) >= trail_dd:
-            return True, f"AUTO_TRAIL: peak={best_pnl:+.2f}%, now={pnl:+.2f}%, drop={best_pnl-pnl:.2f}%"
+            return True, (f"AUTO_TRAIL: peak={best_pnl:+.2f}%, "
+                         f"now={pnl:+.2f}%, drop={best_pnl-pnl:.2f}%")
 
     # 5. P&L stop from position config (legacy, usually wider)
     pnl_stop = pos.get('pnl_stop_pct', -5.0)
     if pnl <= pnl_stop:
         return True, f"AUTO_PNLSTOP: P&L={pnl:+.2f}% ≤ {pnl_stop}%"
 
-    # 6. Timeout
-    max_hours = pos.get('max_hold_hours', CFG('strategy', 'max_hold_hours', 6))
+    # 6. Timeout — v34: live config read
+    max_hours = CFG('strategy', 'max_hold_hours', 6)
     if hours_in > max_hours:
         return True, f"AUTO_TIMEOUT: {hours_in:.1f}ч > {max_hours}ч"
 
@@ -510,7 +557,8 @@ def add_position(coin1, coin2, direction, entry_z, entry_hr,
                  entry_price1, entry_price2, timeframe, notes="",
                  max_hold_hours=None, pnl_stop_pct=None,
                  entry_intercept=0.0, recommended_size=100.0,
-                 z_window=None):
+                 z_window=None, bt_verdict=None, bt_pnl=None,
+                 mu_bt_wr=None, v_quality=None):
     positions = load_positions()
     open_positions = [p for p in positions if p['status'] == 'OPEN']
 
@@ -528,6 +576,35 @@ def add_position(coin1, coin2, direction, entry_z, entry_hr,
 
     pair_name = f"{coin1}/{coin2}"
     pair_name_rev = f"{coin2}/{coin1}"
+
+    # v34: Pair memory blocking — 0 wins after 2+ trades
+    try:
+        from config_loader import pair_memory_is_blocked
+        mem_blocked, mem_reason = pair_memory_is_blocked(pair_name)
+        if not mem_blocked:
+            mem_blocked, mem_reason = pair_memory_is_blocked(pair_name_rev)
+        if mem_blocked:
+            st.warning(mem_reason)
+            return None
+    except ImportError:
+        pass
+
+    # v34: Max coin positions — prevent concentration (UNI in 7/19 trades)
+    max_coin_pos = CFG('monitor', 'max_coin_positions', 2)
+    for coin in [coin1, coin2]:
+        coin_count = sum(1 for p in open_positions
+                        if coin in (p.get('coin1', ''), p.get('coin2', '')))
+        if coin_count >= max_coin_pos:
+            st.error(f"🚫 {coin} уже в {coin_count} позициях (лимит {max_coin_pos}). "
+                    f"Закройте существующие перед открытием новой.")
+            return None
+
+    # v34: BT hard filter — block ❌BT entries in auto-mode
+    bt_mode = CFG('strategy', 'bt_filter_mode', 'HARD')
+    if bt_mode == 'HARD' and bt_verdict == 'FAIL':
+        st.warning(f"🚫 BT HARD FILTER: {pair_name} — бэктест FAIL. "
+                  f"Авто-вход заблокирован. BT P&L={bt_pnl}")
+        return None
 
     # v32: Check pair cooldown
     cd_blocked, cd_reason = check_pair_cooldown(pair_name)
@@ -625,6 +702,14 @@ def add_position(coin1, coin2, direction, entry_z, entry_hr,
         'recommended_size': recommended_size,  # v23.0: position sizing
         'best_pnl_during_trade': 0.0,  # v23.0: best P&L (after commission)
         'z_window': z_window,  # v32: from scanner for consistency
+        # v34: BT metrics from scanner
+        'bt_verdict': bt_verdict,
+        'bt_pnl': bt_pnl,
+        'mu_bt_wr': mu_bt_wr,
+        'v_quality': v_quality,
+        # v34: trailing state
+        '_z_trail_activated': False,
+        '_z_trail_peak': 0.0,
     }
     positions.append(pos)
     save_positions(positions)
@@ -676,7 +761,10 @@ def close_position(pos_id, exit_price1, exit_price2, exit_z, reason,
         # v32: Record trade for cooldown tracking
         try:
             _pair = f"{closed_pos['coin1']}/{closed_pos['coin2']}"
-            record_trade_for_cooldown(_pair, closed_pos.get('pnl_pct', 0), closed_pos.get('direction', ''))
+            record_trade_for_cooldown(
+                _pair, closed_pos.get('pnl_pct', 0),
+                closed_pos.get('direction', ''),
+                closed_pos.get('exit_reason', ''))  # v34: pass reason for SL detection
         except Exception:
             pass
         # v27: Update pair memory
