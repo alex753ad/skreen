@@ -1,6 +1,7 @@
 # ═══════════════════════════════════════════════════════════════
-# ЕДИНЫЙ КОНФИГ — Mean Reversion Pairs Trading System v27
+# ЕДИНЫЙ КОНФИГ — Mean Reversion Pairs Trading System v33
 # ═══════════════════════════════════════════════════════════════
+# STREAMLIT CLOUD версия
 # Все приложения (scanner, monitor, backtester, analysis)
 # читают параметры из этого файла.
 # Редактируйте ТОЛЬКО здесь — все приложения подхватят.
@@ -14,7 +15,7 @@ strategy:
   min_stop_z: 4.0
   take_profit_pct: 1.5
   stop_loss_pct: -5.0
-  max_hold_hours: 3
+  max_hold_hours: 6           # v33: было 3 → 6ч золотая середина (phantom показал оптимум 5-8ч)
   micro_bt_max_bars: 6
   min_hurst: 0.45
   warn_hurst: 0.48
@@ -34,7 +35,7 @@ scanner:
 
 # --- МОНИТОР ---
 monitor:
-  refresh_interval_sec: 120
+  refresh_interval_sec: 60    # v33: было 120 → 60с (ZEC/OKB SL проскочил за 2мин)
   exit_z_target: 0.5
   pnl_stop_pct: -1.2
   trailing_z_bounce: 0.8
@@ -49,25 +50,33 @@ monitor:
   hurst_border: 0.45
   pvalue_warning: 0.10
   correlation_warning: 0.20
-  # --- AUTO-EXIT ---
+
+  # --- AUTO-EXIT --- v33: КРИТИЧЕСКАЯ КАЛИБРОВКА
   auto_exit_enabled: true
-  auto_tp_pct: 0.8
-  auto_sl_pct: -1.2
-  auto_exit_z: 0.3
-  auto_exit_z_min_pnl: 0.3
+  auto_tp_pct: 1.5            # v33: было 0.8 → phantom доказал: все 9 wins > 1.5%
+  auto_sl_pct: -1.2           # оставить — работает
+  auto_exit_z: 0.3            # оставить — хороший порог
+  auto_exit_z_min_pnl: 0.5    # v33: было 0.3 → не закрывать мелкую прибыль при Z→0
+
+  # --- TRAILING --- v33: КЛЮЧЕВОЕ ИЗМЕНЕНИЕ
   trailing_enabled: true
-  trailing_activate_pct: 0.5
-  trailing_drawdown_pct: 0.25
+  trailing_activate_pct: 1.0   # v33: было 0.5 → IP/UNI trail закрыл +0.08% вместо +4.30%
+  trailing_drawdown_pct: 0.5   # v33: было 0.25 → NEAR/FIL trail закрыл +0.31% вместо +1.62%
+
   # --- CONFLICT & COOLDOWN ---
   auto_flip_enabled: true
-  pair_cooldown_hours: 4
-  pair_loss_limit_pct: -2.0
+  pair_cooldown_hours: 4       # оставить
+  pair_loss_limit_pct: -2.0    # оставить
   coin_loss_warn_pct: -3.0
   daily_loss_limit_pct: -5.0
+
   # --- LIMITS ---
   max_positions: 10
   max_coin_exposure: 4
-  entry_grace_minutes: 15
+  entry_grace_minutes: 10      # v33: было 15 → для скальпа достаточно
+
+  # --- PHANTOM --- v33
+  phantom_track_hours: 12      # v33: было 24 → достаточно для скальпа
 
 # --- БЭКТЕСТЕР ---
 backtester:

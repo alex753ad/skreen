@@ -25,12 +25,15 @@ except ImportError:
         """Fallback: return defaults if config_loader not available."""
         _d = {'strategy': {'entry_z': 1.8, 'exit_z': 0.5, 'stop_z_offset': 2.0,
               'min_stop_z': 4.0, 'take_profit_pct': 1.5, 'stop_loss_pct': -5.0,
-              'max_hold_hours': 3, 'micro_bt_max_bars': 6, 'min_hurst': 0.45,
+              'max_hold_hours': 6, 'micro_bt_max_bars': 6, 'min_hurst': 0.45,
               'hr_naked_threshold': 0.15, 'commission_pct': 0.10, 'slippage_pct': 0.05},
               'scanner': {'coins_limit': 100, 'timeframe': '4h', 'lookback_days': 50,
               'exchange': 'okx', 'refresh_interval_min': 10},
               'rally_filter': {'warning_z': 2.0, 'block_z': 2.5, 'exit_z': 0.0, 'cooldown_bars': 2},
-              'monitor': {'exit_z_target': 0.5, 'max_positions': 10}}
+              'monitor': {'exit_z_target': 0.5, 'max_positions': 10,
+              'auto_tp_pct': 1.5, 'auto_sl_pct': -1.2,
+              'trailing_activate_pct': 1.0, 'trailing_drawdown_pct': 0.5,
+              'phantom_track_hours': 12}}
         if key is None:
             return _d.get(section, {})
         return _d.get(section, {}).get(key, default)
